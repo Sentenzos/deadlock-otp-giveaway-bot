@@ -24,6 +24,11 @@ from .twitch_chat import TwitchChat, TwitchChatState, TwitchLiveMonitor
 logger = logging.getLogger(__name__)
 MOSCOW_TIMEZONE = timezone(timedelta(hours=3), name="МСК")
 STREAM_ANNOUNCE_COOLDOWN_SECONDS = 30 * 60
+PUBLIC_COMMAND_COOLDOWNS_SECONDS = {
+    "start": 3,
+    "status": 5,
+    "link": 10,
+}
 LAST_STREAM_OFFLINE_STATE_KEY = "last_stream_offline_at"
 LAST_ANNOUNCED_STREAM_STATE_KEY = "last_announced_stream_started_at"
 ConfigureTwitchAnnouncements = Callable[
@@ -615,6 +620,24 @@ def build_router(
 ) -> Router:
     router = Router(name="giveaway")
     finish_confirmations: dict[int, tuple[int, float]] = {}
+    public_command_timestamps: dict[tuple[int, str], float] = {}
+
+    async def check_public_cooldown(message: Message, command: str) -> bool:
+        if message.from_user is None or message.from_user.id == settings.owner_telegram_id:
+            return True
+        cooldown_seconds = PUBLIC_COMMAND_COOLDOWNS_SECONDS[command]
+        key = (message.from_user.id, command)
+        now = time.time()
+        previous = public_command_timestamps.get(key)
+        if previous is not None:
+            retry_after = cooldown_seconds - int(now - previous)
+            if retry_after > 0:
+                await message.answer(
+                    f"Слишком часто. Повторите команду через {retry_after} сек."
+                )
+                return False
+        public_command_timestamps[key] = now
+        return True
 
     async def send_link_instructions(message: Message) -> None:
         if message.chat.type != ChatType.PRIVATE or message.from_user is None:
@@ -652,7 +675,11 @@ def build_router(
     @router.message(CommandStart())
     async def start(message: Message, command: CommandObject) -> None:
         if (command.args or "").strip().casefold() == "link":
+            if not await check_public_cooldown(message, "link"):
+                return
             await send_link_instructions(message)
+            return
+        if not await check_public_cooldown(message, "start"):
             return
         await message.answer(
             "Я провожу розыгрыши для Twitch-чата.\n\n"
@@ -666,6 +693,8 @@ def build_router(
     @router.message(Command("status"))
     async def tracking_status(message: Message) -> None:
         if message.chat.type != ChatType.PRIVATE:
+            return
+        if not await check_public_cooldown(message, "status"):
             return
 
         if refresh_stream_status is not None:
@@ -702,6 +731,8 @@ def build_router(
 
     @router.message(Command("link"))
     async def link(message: Message) -> None:
+        if not await check_public_cooldown(message, "link"):
+            return
         await send_link_instructions(message)
 
     @router.message(Command("viewers"))

@@ -210,18 +210,21 @@ class BotCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_link_requires_active_giveaway_and_issues_scoped_code(self) -> None:
         message = self.message(101, full_name="Alice", username="alice_tg")
-        await self.handlers["link"](message)
+        with patch("app.main.time.time", return_value=1000):
+            await self.handlers["link"](message)
         self.assertIn("нет активного розыгрыша", message.last_text)
 
         giveaway = await self.storage.start_giveaway(10, 2, title="Тест")
         message.answers.clear()
-        await self.handlers["link"](message)
+        with patch("app.main.time.time", return_value=1011):
+            await self.handlers["link"](message)
 
         match = re.search(r"!link ([A-Z0-9]{8})", message.last_text)
         self.assertIsNotNone(match)
         first_code = match.group(1)
         message.answers.clear()
-        await self.handlers["link"](message)
+        with patch("app.main.time.time", return_value=1022):
+            await self.handlers["link"](message)
         repeated_match = re.search(r"!link ([A-Z0-9]{8})", message.last_text)
         self.assertIsNotNone(repeated_match)
         self.assertEqual(repeated_match.group(1), first_code)
@@ -232,6 +235,24 @@ class BotCommandTests(unittest.IsolatedAsyncioTestCase):
             )
         ).fetchone()
         self.assertEqual((row["giveaway_id"], row["telegram_username"]), (giveaway.id, "alice_tg"))
+
+    async def test_public_link_command_has_cooldown(self) -> None:
+        await self.storage.start_giveaway(10, 2, title="Cooldown")
+        message = self.message(101, full_name="Alice", username="alice_tg")
+
+        with patch("app.main.time.time", return_value=1000):
+            await self.handlers["link"](message)
+        with patch("app.main.time.time", return_value=1005):
+            await self.handlers["link"](message)
+
+        self.assertIn("Слишком часто", message.last_text)
+        self.assertIn("через 5 сек", message.last_text)
+        row = await (
+            await self.storage._db.execute(
+                "SELECT COUNT(*) AS total FROM link_codes WHERE telegram_user_id = 101"
+            )
+        ).fetchone()
+        self.assertEqual(row["total"], 1)
 
     async def test_link_waits_until_twitch_chat_collector_is_connected(self) -> None:
         await self.storage.start_giveaway(10, 2, title="Тест")
@@ -264,6 +285,22 @@ class BotCommandTests(unittest.IsolatedAsyncioTestCase):
         ).fetchone()
         self.assertEqual(row["giveaway_id"], giveaway.id)
 
+    async def test_deep_link_start_uses_link_cooldown(self) -> None:
+        await self.storage.start_giveaway(10, 2, title="Deep cooldown")
+        message = self.message(101, full_name="Alice", username="alice_tg")
+
+        with patch("app.main.time.time", return_value=1000):
+            await self.handlers["start"](
+                message, CommandObject(command="start", args="link")
+            )
+        with patch("app.main.time.time", return_value=1001):
+            await self.handlers["start"](
+                message, CommandObject(command="start", args="link")
+            )
+
+        self.assertIn("Слишком часто", message.last_text)
+        self.assertIn("через 9 сек", message.last_text)
+
     async def test_status_refreshes_stream_and_shows_personal_progress(self) -> None:
         giveaway = await self.storage.start_giveaway(10, 2, title="Тест")
         await self.register(giveaway, 101, "Alice", "alice_tg", "alice_tv", "777")
@@ -279,6 +316,29 @@ class BotCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Сообщения: 1 из 2", message.last_text)
         self.assertIn("Зарегистрировано участников: <b>1</b>", message.last_text)
         self.assertNotIn("Диагностика для владельца", message.last_text)
+
+    async def test_public_status_command_has_cooldown(self) -> None:
+        message = self.message(101, full_name="Alice", username="alice_tg")
+
+        with patch("app.main.time.time", return_value=1000):
+            await self.handlers["tracking_status"](message)
+        with patch("app.main.time.time", return_value=1002):
+            await self.handlers["tracking_status"](message)
+
+        self.assertEqual(self.refresh_calls, 1)
+        self.assertIn("Слишком часто", message.last_text)
+        self.assertIn("через 3 сек", message.last_text)
+
+    async def test_owner_public_commands_are_not_rate_limited(self) -> None:
+        owner = self.message(1)
+
+        with patch("app.main.time.time", return_value=1000):
+            await self.handlers["tracking_status"](owner)
+        with patch("app.main.time.time", return_value=1001):
+            await self.handlers["tracking_status"](owner)
+
+        self.assertEqual(self.refresh_calls, 2)
+        self.assertNotIn("Слишком часто", owner.last_text)
 
     async def test_owner_status_contains_diagnostics_but_public_status_does_not(self) -> None:
         await self.storage.start_giveaway(1, 1)
