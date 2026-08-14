@@ -8,6 +8,7 @@ import secrets
 import time
 from collections.abc import Awaitable, Callable, Iterator
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
 from aiogram import Bot, Dispatcher, Router
 from aiogram.enums import ChatType, ParseMode
@@ -46,6 +47,15 @@ def duration_text(seconds: int) -> str:
 def giveaway_datetime_text(timestamp: int) -> str:
     value = datetime.fromtimestamp(timestamp, MOSCOW_TIMEZONE)
     return value.strftime("%d.%m.%Y в %H:%M (МСК)")
+
+
+def twitch_profile_link(login: str) -> str:
+    clean_login = login.lstrip("@#")
+    profile_url = f"https://www.twitch.tv/{quote(clean_login, safe='')}"
+    return (
+        f'<a href="{html.escape(profile_url, quote=True)}">'
+        f"{html.escape(clean_login)}</a>"
+    )
 
 
 def parse_giveaway_end_at(date_text: str, time_text: str) -> int:
@@ -347,7 +357,7 @@ def giveaway_start_announcement(giveaway: Giveaway, bot_username: str) -> str:
         [
             "",
             "📋 <b>Условия участия</b>",
-            f"• Время в Twitch-чате: не менее <b>{giveaway.min_seconds // 60} мин</b>",
+            f"• Время просмотра трансляции: не менее <b>{giveaway.min_seconds // 60} мин</b>",
             f"• Сообщения в Twitch-чате: не менее <b>{giveaway.min_messages}</b>",
             f"• Интервал между засчитанными сообщениями: <b>{giveaway.message_interval_seconds} сек</b>",
             f"• Количество победителей: <b>{giveaway.winner_count}</b>",
@@ -641,9 +651,27 @@ def build_router(
 
     async def send_link_instructions(message: Message) -> None:
         if message.chat.type != ChatType.PRIVATE or message.from_user is None:
+            if not await check_public_cooldown(message, "link"):
+                return
             await message.answer("Для безопасности привязку нужно начать в личных сообщениях с ботом.")
             return
         giveaway = await storage.active_giveaway()
+        if giveaway is not None:
+            registration = await storage.participant_stats(
+                giveaway, message.from_user.id
+            )
+            if registration is not None:
+                await message.answer(
+                    f"Вы уже зарегистрированы в розыгрыше "
+                    f"<b>{html.escape(giveaway.title)}</b>.\n\n"
+                    "Telegram уже привязан к Twitch-аккаунту "
+                    f"{twitch_profile_link(registration.twitch_login)}.\n"
+                    "Повторно выполнять /link не нужно.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+        if not await check_public_cooldown(message, "link"):
+            return
         if giveaway is None:
             await message.answer(
                 "Сейчас нет активного розыгрыша, поэтому регистрироваться пока некуда. "
@@ -664,7 +692,7 @@ def build_router(
         )
         await message.answer(
             f"Регистрация в розыгрыше <b>{html.escape(giveaway.title)}</b>.\n\n"
-            f"Откройте чат Twitch-канала <b>{html.escape(settings.twitch_channel)}</b> "
+            f"Откройте чат Twitch-канала {twitch_profile_link(settings.twitch_channel)} "
             "и в течение 10 минут отправьте:\n\n"
             f"<code>!link {code}</code>\n\n"
             "Не пересылайте этот код другим людям. Для следующего розыгрыша "
@@ -675,8 +703,6 @@ def build_router(
     @router.message(CommandStart())
     async def start(message: Message, command: CommandObject) -> None:
         if (command.args or "").strip().casefold() == "link":
-            if not await check_public_cooldown(message, "link"):
-                return
             await send_link_instructions(message)
             return
         if not await check_public_cooldown(message, "start"):
@@ -731,8 +757,6 @@ def build_router(
 
     @router.message(Command("link"))
     async def link(message: Message) -> None:
-        if not await check_public_cooldown(message, "link"):
-            return
         await send_link_instructions(message)
 
     @router.message(Command("viewers"))

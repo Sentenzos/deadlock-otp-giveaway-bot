@@ -245,6 +245,36 @@ class TwitchChatTests(unittest.IsolatedAsyncioTestCase):
             [("viewer_tv", "778", False, False)],
         )
 
+    async def test_link_is_claimed_when_stream_tracking_is_disabled(self) -> None:
+        storage = FakeStorage()
+        linked: list[tuple[int, str]] = []
+
+        async def notify_linked(telegram_user_id: int, name: str) -> None:
+            linked.append((telegram_user_id, name))
+
+        chat = TwitchChat(
+            channel="deadlock_otp",
+            bot_login="deadlock_otp",
+            oauth_token="token",
+            storage=storage,  # type: ignore[arg-type]
+            notify_linked=notify_linked,
+            tracking_enabled=lambda: False,
+        )
+
+        await chat._handle_privmsg(
+            {"user-id": "778"},
+            ":viewer_tv!viewer_tv@viewer_tv.tmi.twitch.tv "
+            "PRIVMSG #deadlock_otp :!link ABCD1234",
+        )
+        await asyncio.sleep(0)
+
+        self.assertEqual(storage.claims, [("ABCD1234", "viewer_tv", "778")])
+        self.assertEqual(linked, [(101, "Alice")])
+        self.assertEqual(
+            storage.presence_events,
+            [("viewer_tv", "778", False, False)],
+        )
+
     async def test_channel_owner_message_is_counted_when_not_excluded(self) -> None:
         storage = FakeStorage()
 

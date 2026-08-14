@@ -66,6 +66,8 @@ class MainCommandTests(unittest.TestCase):
         self.assertIn("🗓 <b>Плановое завершение</b>", text)
         self.assertIn("31.12.2099 в 23:59 (МСК)", text)
         self.assertIn("не менее <b>10</b> допущенных участников", text)
+        self.assertIn("Время просмотра трансляции:", text)
+        self.assertNotIn("Время в Twitch-чате:", text)
 
     def test_personal_stats_text_shows_progress(self) -> None:
         giveaway = Giveaway(1, "active", "Тест", "", 1, 1, 3600, 5, 0, 1, None, None)

@@ -236,6 +236,50 @@ class BotCommandTests(unittest.IsolatedAsyncioTestCase):
         ).fetchone()
         self.assertEqual((row["giveaway_id"], row["telegram_username"]), (giveaway.id, "alice_tg"))
 
+    async def test_link_can_be_completed_before_stream_starts(self) -> None:
+        giveaway = await self.storage.start_giveaway(10, 2, title="До стрима")
+        self.twitch_state.mark_stream_offline()
+        message = self.message(101, full_name="Alice", username="alice_tg")
+
+        await self.handlers["link"](message)
+
+        match = re.search(r"!link ([A-Z0-9]{8})", message.last_text)
+        self.assertIsNotNone(match)
+        status, telegram_id, _ = await self.storage.claim_link_code(
+            match.group(1), "alice_tv", "777"
+        )
+        stats = await self.storage.participant_stats(giveaway, 101)
+        self.assertEqual((status, telegram_id), ("linked", 101))
+        self.assertIsNotNone(stats)
+        self.assertEqual((stats.seconds, stats.messages), (0, 0))
+
+    async def test_link_after_registration_reports_existing_twitch_account(self) -> None:
+        giveaway = await self.storage.start_giveaway(10, 2, title="Повторная связь")
+        message = self.message(101, full_name="Alice", username="alice_tg")
+
+        with patch("app.main.time.time", return_value=1000):
+            await self.handlers["link"](message)
+            match = re.search(r"!link ([A-Z0-9]{8})", message.last_text)
+            self.assertIsNotNone(match)
+            await self.storage.claim_link_code(match.group(1), "alice_tv", "777")
+
+        with patch("app.main.time.time", return_value=1001):
+            await self.handlers["link"](message)
+
+        self.assertIn("уже зарегистрированы", message.last_text)
+        self.assertIn("Повторно выполнять /link не нужно", message.last_text)
+        self.assertIn(
+            '<a href="https://www.twitch.tv/alice_tv">alice_tv</a>',
+            message.last_text,
+        )
+        self.assertNotIn("Слишком часто", message.last_text)
+        row = await (
+            await self.storage._db.execute(
+                "SELECT COUNT(*) AS total FROM link_codes WHERE telegram_user_id = 101"
+            )
+        ).fetchone()
+        self.assertEqual(row["total"], 0)
+
     async def test_public_link_command_has_cooldown(self) -> None:
         await self.storage.start_giveaway(10, 2, title="Cooldown")
         message = self.message(101, full_name="Alice", username="alice_tg")
@@ -278,6 +322,10 @@ class BotCommandTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIn("!link", message.last_text)
+        self.assertIn(
+            '<a href="https://www.twitch.tv/deadlock_otp">deadlock_otp</a>',
+            message.last_text,
+        )
         row = await (
             await self.storage._db.execute(
                 "SELECT giveaway_id FROM link_codes WHERE telegram_user_id = 101"
