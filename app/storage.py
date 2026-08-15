@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 import secrets
 import time
 
 import aiosqlite
+
+
+_UNSET = object()
+SQLITE_MAX_INTEGER = (1 << 63) - 1
+DRAW_SCORE_MAX = 999_999_999_999
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,12 +55,90 @@ class Participant:
     telegram_username: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class DrawEligibility:
+    telegram_member: bool
+    reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DrawParticipant:
+    telegram_user_id: int
+    telegram_name: str
+    telegram_username: str | None
+    twitch_login: str
+    twitch_user_id: str
+    registered_at: int
+    seconds: int
+    messages: int
+    time_requirement_met: bool
+    message_requirement_met: bool
+    excluded_by_twitch: bool
+    excluded_by_telegram: bool
+    eligibility_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DrawRound:
+    id: int
+    giveaway_id: int
+    round_number: int
+    round_kind: str
+    cutoff_at: int
+    created_at: int
+    forced: bool
+    requested_winner_count: int
+    registered_count: int
+    eligible_count: int
+    min_participants_required: int
+    min_participants_met: bool
+    title: str
+    prize: str
+    min_seconds: int
+    min_messages: int
+
+
+@dataclass(frozen=True, slots=True)
+class DrawEntry:
+    round_id: int
+    giveaway_id: int
+    telegram_user_id: int
+    telegram_name: str
+    telegram_username: str | None
+    twitch_login: str
+    twitch_user_id: str
+    registered_at: int
+    seconds: int
+    messages: int
+    time_requirement_met: bool
+    message_requirement_met: bool
+    excluded_by_twitch: bool
+    excluded_by_telegram: bool
+    telegram_member: bool
+    previous_winner: bool
+    final_eligible: bool
+    eligibility_reason: str | None
+    # Kept as a decimal string outside SQLite so report consumers preserve any
+    # leading zeroes when displaying the fixed-width 12-digit draw value.
+    random_score: str
+    draw_rank: int | None
+    winner_position: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class DrawResult:
+    round: DrawRound
+    entries: tuple[DrawEntry, ...]
+    winners: tuple[DrawEntry, ...]
+
+
 class Storage:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.db: aiosqlite.Connection | None = None
         self._link_code_lock = asyncio.Lock()
         self._tracking_session_lock = asyncio.Lock()
+        self._giveaway_mutation_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -145,6 +229,54 @@ class Storage:
                 drawn_at INTEGER NOT NULL,
                 position INTEGER NOT NULL,
                 PRIMARY KEY (giveaway_id, telegram_user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS giveaway_draw_rounds (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                giveaway_id INTEGER NOT NULL REFERENCES giveaways(id),
+                round_number INTEGER NOT NULL CHECK(round_number >= 1),
+                round_kind TEXT NOT NULL CHECK(round_kind IN ('finish', 'reroll')),
+                cutoff_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                forced INTEGER NOT NULL CHECK(forced IN (0, 1)),
+                requested_winner_count INTEGER NOT NULL CHECK(requested_winner_count >= 1),
+                registered_count INTEGER NOT NULL CHECK(registered_count >= 0),
+                eligible_count INTEGER NOT NULL CHECK(eligible_count >= 0),
+                min_participants_required INTEGER NOT NULL CHECK(min_participants_required >= 1),
+                min_participants_met INTEGER NOT NULL CHECK(min_participants_met IN (0, 1)),
+                title TEXT NOT NULL,
+                prize TEXT NOT NULL,
+                min_seconds INTEGER NOT NULL CHECK(min_seconds >= 0),
+                min_messages INTEGER NOT NULL CHECK(min_messages >= 0),
+                UNIQUE (giveaway_id, round_number)
+            );
+
+            CREATE TABLE IF NOT EXISTS giveaway_draw_entries (
+                round_id INTEGER NOT NULL REFERENCES giveaway_draw_rounds(id),
+                giveaway_id INTEGER NOT NULL REFERENCES giveaways(id),
+                telegram_user_id INTEGER NOT NULL,
+                telegram_name TEXT NOT NULL,
+                telegram_username TEXT,
+                twitch_login TEXT NOT NULL,
+                twitch_user_id TEXT NOT NULL,
+                registered_at INTEGER NOT NULL,
+                seconds INTEGER NOT NULL CHECK(seconds >= 0),
+                messages INTEGER NOT NULL CHECK(messages >= 0),
+                time_requirement_met INTEGER NOT NULL CHECK(time_requirement_met IN (0, 1)),
+                message_requirement_met INTEGER NOT NULL CHECK(message_requirement_met IN (0, 1)),
+                excluded_by_twitch INTEGER NOT NULL CHECK(excluded_by_twitch IN (0, 1)),
+                excluded_by_telegram INTEGER NOT NULL CHECK(excluded_by_telegram IN (0, 1)),
+                telegram_member INTEGER NOT NULL CHECK(telegram_member IN (0, 1)),
+                previous_winner INTEGER NOT NULL CHECK(previous_winner IN (0, 1)),
+                final_eligible INTEGER NOT NULL CHECK(final_eligible IN (0, 1)),
+                eligibility_reason TEXT,
+                random_score INTEGER NOT NULL CHECK(random_score >= 0),
+                draw_rank INTEGER CHECK(draw_rank >= 1),
+                winner_position INTEGER CHECK(winner_position >= 1),
+                PRIMARY KEY (round_id, telegram_user_id),
+                UNIQUE (round_id, twitch_login),
+                UNIQUE (round_id, random_score),
+                UNIQUE (round_id, winner_position)
             );
 
             CREATE TABLE IF NOT EXISTS runtime_state (
@@ -433,10 +565,14 @@ class Storage:
     async def claim_link_code(
         self, code: str, twitch_login: str, twitch_user_id: str
     ) -> tuple[str, int | None, str | None]:
-        async with self._link_code_lock:
-            return await self._claim_link_code_unlocked(
-                code, twitch_login, twitch_user_id
-            )
+        # Registration and finishing must be serialized. Otherwise a claim that
+        # started just before the draw could insert a registration after the
+        # immutable draw snapshot had already been committed.
+        async with self._giveaway_mutation_lock:
+            async with self._link_code_lock:
+                return await self._claim_link_code_unlocked(
+                    code, twitch_login, twitch_user_id
+                )
 
     async def _claim_link_code_unlocked(
         self, code: str, twitch_login: str, twitch_user_id: str
@@ -446,9 +582,39 @@ class Storage:
         Returns `(status, telegram_user_id, telegram_name)`, where status is
         `linked`, `missing`, `expired`, `giveaway_closed`, or `already_linked`.
         """
+        # A dedicated transaction prevents unrelated handlers using ``self._db``
+        # from committing a half-finished link operation. BEGIN IMMEDIATE also
+        # makes the active-state check and registration insertion atomic against
+        # another process that may be finishing the same giveaway.
+        claim_db = await aiosqlite.connect(self.path, timeout=30)
+        claim_db.row_factory = aiosqlite.Row
+        try:
+            await claim_db.execute("PRAGMA foreign_keys = ON")
+            await claim_db.execute("BEGIN IMMEDIATE")
+            result = await self._claim_link_code_transaction(
+                claim_db,
+                code,
+                twitch_login,
+                twitch_user_id,
+            )
+            await claim_db.commit()
+            return result
+        except Exception:
+            await claim_db.rollback()
+            raise
+        finally:
+            await claim_db.close()
+
+    async def _claim_link_code_transaction(
+        self,
+        claim_db: aiosqlite.Connection,
+        code: str,
+        twitch_login: str,
+        twitch_user_id: str,
+    ) -> tuple[str, int | None, str | None]:
         now = self.now()
         row = await (
-            await self._db.execute(
+            await claim_db.execute(
                 """SELECT telegram_user_id, telegram_name, expires_at, giveaway_id,
                           telegram_username
                    FROM link_codes WHERE code = ?""",
@@ -458,18 +624,28 @@ class Storage:
         if row is None:
             return "missing", None, None
         if row["expires_at"] < now:
-            await self._db.execute("DELETE FROM link_codes WHERE code = ?", (code.upper(),))
-            await self._db.commit()
+            await claim_db.execute(
+                "DELETE FROM link_codes WHERE code = ?", (code.upper(),)
+            )
             return "expired", None, None
 
-        giveaway = await self.active_giveaway()
-        if giveaway is None or row["giveaway_id"] is None or int(row["giveaway_id"]) != giveaway.id:
-            await self._db.execute("DELETE FROM link_codes WHERE code = ?", (code.upper(),))
-            await self._db.commit()
+        giveaway_id = int(row["giveaway_id"]) if row["giveaway_id"] is not None else None
+        active_row = None
+        if giveaway_id is not None:
+            active_row = await (
+                await claim_db.execute(
+                    "SELECT id FROM giveaways WHERE id = ? AND state = 'active'",
+                    (giveaway_id,),
+                )
+            ).fetchone()
+        if active_row is None:
+            await claim_db.execute(
+                "DELETE FROM link_codes WHERE code = ?", (code.upper(),)
+            )
             return "giveaway_closed", None, None
 
         existing = await (
-            await self._db.execute(
+            await claim_db.execute(
                 """SELECT telegram_user_id FROM twitch_links
                    WHERE twitch_user_id = ? OR twitch_login = ?""",
                 (twitch_user_id, twitch_login),
@@ -483,10 +659,10 @@ class Storage:
         if existing is not None and int(existing["telegram_user_id"]) != telegram_user_id:
             return "already_linked", None, None
 
-        await self._db.execute(
+        await claim_db.execute(
             "DELETE FROM twitch_links WHERE telegram_user_id = ?", (telegram_user_id,)
         )
-        await self._db.execute(
+        await claim_db.execute(
             """INSERT INTO twitch_links
                (twitch_login, twitch_user_id, telegram_user_id, telegram_name, linked_at,
                 telegram_username)
@@ -500,12 +676,12 @@ class Storage:
                 telegram_username,
             ),
         )
-        await self._db.execute(
+        await claim_db.execute(
             """DELETE FROM giveaway_registrations
                WHERE giveaway_id = ? AND telegram_user_id = ?""",
-            (giveaway.id, telegram_user_id),
+            (giveaway_id, telegram_user_id),
         )
-        await self._db.execute(
+        await claim_db.execute(
             """INSERT INTO giveaway_registrations
                (giveaway_id, twitch_login, twitch_user_id, telegram_user_id, telegram_name,
                 registered_at, telegram_username)
@@ -517,7 +693,7 @@ class Storage:
                    registered_at = excluded.registered_at,
                    telegram_username = excluded.telegram_username""",
             (
-                giveaway.id,
+                giveaway_id,
                 twitch_login,
                 twitch_user_id,
                 telegram_user_id,
@@ -526,8 +702,9 @@ class Storage:
                 telegram_username,
             ),
         )
-        await self._db.execute("DELETE FROM link_codes WHERE code = ?", (code.upper(),))
-        await self._db.commit()
+        await claim_db.execute(
+            "DELETE FROM link_codes WHERE code = ?", (code.upper(),)
+        )
         return "linked", telegram_user_id, telegram_name
 
     async def mark_joined(
@@ -611,6 +788,12 @@ class Storage:
             raise ValueError("Минимумы должны быть положительными числами.")
         if message_interval_seconds < 0:
             raise ValueError("Интервал между сообщениями не может быть отрицательным.")
+        if min_minutes > SQLITE_MAX_INTEGER // 60:
+            raise ValueError("Указано слишком большое количество минут.")
+        if min_messages > SQLITE_MAX_INTEGER:
+            raise ValueError("Указано слишком большое количество сообщений.")
+        if message_interval_seconds > SQLITE_MAX_INTEGER:
+            raise ValueError("Указан слишком большой интервал между сообщениями.")
         if winner_count > 100:
             raise ValueError("Количество победителей не должно быть больше 100.")
         if min_participants > 100_000:
@@ -678,6 +861,145 @@ class Storage:
             None,
             end_at,
         )
+
+    async def update_active_giveaway(
+        self, **changes: object
+    ) -> Giveaway | None:
+        async with self._giveaway_mutation_lock:
+            return await self._update_active_giveaway_unlocked(**changes)
+
+    async def _update_active_giveaway_unlocked(
+        self,
+        *,
+        min_minutes: int | object = _UNSET,
+        min_messages: int | object = _UNSET,
+        winner_count: int | object = _UNSET,
+        message_interval_seconds: int | object = _UNSET,
+        min_participants: int | object = _UNSET,
+        end_at: int | None | object = _UNSET,
+        title: str | object = _UNSET,
+        prize: str | object = _UNSET,
+    ) -> Giveaway | None:
+        supplied = {
+            "min_minutes": min_minutes,
+            "min_messages": min_messages,
+            "winner_count": winner_count,
+            "message_interval_seconds": message_interval_seconds,
+            "min_participants": min_participants,
+            "end_at": end_at,
+            "title": title,
+            "prize": prize,
+        }
+        if all(value is _UNSET for value in supplied.values()):
+            raise ValueError("Не указаны параметры для изменения.")
+
+        giveaway = await self.active_giveaway()
+        if giveaway is None:
+            return None
+
+        set_parts: list[str] = []
+        values: list[int | str | None] = []
+
+        if min_minutes is not _UNSET:
+            if not isinstance(min_minutes, int) or isinstance(min_minutes, bool):
+                raise ValueError("Минимальное время должно быть целым числом минут.")
+            if min_minutes < 1:
+                raise ValueError("Минимальное время должно быть не меньше 1 минуты.")
+            if min_minutes > SQLITE_MAX_INTEGER // 60:
+                raise ValueError("Указано слишком большое количество минут.")
+            set_parts.append("min_seconds = ?")
+            values.append(min_minutes * 60)
+
+        if min_messages is not _UNSET:
+            if not isinstance(min_messages, int) or isinstance(min_messages, bool):
+                raise ValueError("Минимальное количество сообщений должно быть целым числом.")
+            if min_messages < 1:
+                raise ValueError("Минимальное количество сообщений должно быть не меньше 1.")
+            if min_messages > SQLITE_MAX_INTEGER:
+                raise ValueError("Указано слишком большое количество сообщений.")
+            set_parts.append("min_messages = ?")
+            values.append(min_messages)
+
+        if winner_count is not _UNSET:
+            if not isinstance(winner_count, int) or isinstance(winner_count, bool):
+                raise ValueError("Количество победителей должно быть целым числом.")
+            if not 1 <= winner_count <= 100:
+                raise ValueError("Количество победителей должно быть от 1 до 100.")
+            set_parts.append("winner_count = ?")
+            values.append(winner_count)
+
+        if message_interval_seconds is not _UNSET:
+            if not isinstance(message_interval_seconds, int) or isinstance(
+                message_interval_seconds, bool
+            ):
+                raise ValueError("Интервал между сообщениями должен быть целым числом секунд.")
+            if message_interval_seconds < 0:
+                raise ValueError("Интервал между сообщениями не может быть отрицательным.")
+            if message_interval_seconds > SQLITE_MAX_INTEGER:
+                raise ValueError("Указан слишком большой интервал между сообщениями.")
+            set_parts.append("message_interval_seconds = ?")
+            values.append(message_interval_seconds)
+
+        if min_participants is not _UNSET:
+            if not isinstance(min_participants, int) or isinstance(min_participants, bool):
+                raise ValueError("Минимальное количество участников должно быть целым числом.")
+            if not 1 <= min_participants <= 100_000:
+                raise ValueError(
+                    "Минимальное количество участников должно быть от 1 до 100000."
+                )
+            set_parts.append("min_participants = ?")
+            values.append(min_participants)
+
+        if end_at is not _UNSET:
+            if end_at is not None and (
+                not isinstance(end_at, int) or isinstance(end_at, bool)
+            ):
+                raise ValueError("Дата завершения должна быть указана целым timestamp.")
+            if end_at is not None and end_at <= self.now():
+                raise ValueError("Дата и время завершения должны быть в будущем.")
+            set_parts.append("end_at = ?")
+            values.append(end_at)
+
+        if title is not _UNSET:
+            if not isinstance(title, str):
+                raise ValueError("Название розыгрыша должно быть текстом.")
+            normalized_title = title.strip()
+            if not normalized_title:
+                raise ValueError("Название розыгрыша не может быть пустым.")
+            if len(normalized_title) > 120:
+                raise ValueError("Название розыгрыша не должно быть длиннее 120 символов.")
+            set_parts.extend(("title = ?", "title_key = ?"))
+            values.extend((normalized_title, normalized_title.casefold()))
+
+        if prize is not _UNSET:
+            if not isinstance(prize, str):
+                raise ValueError("Описание награды должно быть текстом.")
+            normalized_prize = prize.strip()
+            if len(normalized_prize) > 300:
+                raise ValueError("Описание награды не должно быть длиннее 300 символов.")
+            set_parts.append("prize = ?")
+            values.append(normalized_prize)
+
+        try:
+            cursor = await self._db.execute(
+                f"""UPDATE giveaways SET {', '.join(set_parts)}
+                    WHERE id = ? AND state = 'active'""",
+                (*values, giveaway.id),
+            )
+            await self._db.commit()
+        except Exception:
+            await self._db.rollback()
+            raise
+        if cursor.rowcount == 0:
+            return None
+        row = await (
+            await self._db.execute(
+                """SELECT id, state, title, prize, winner_count, min_participants, min_seconds, min_messages, message_interval_seconds, started_at, finished_at, eligible_count_at_finish, end_at, twitch_announce_enabled, twitch_announce_interval_seconds, twitch_last_announce_at
+                   FROM giveaways WHERE id = ? AND state = 'active'""",
+                (giveaway.id,),
+            )
+        ).fetchone()
+        return self._giveaway_from_row(row)
 
     async def active_giveaway(self) -> Giveaway | None:
         row = await (
@@ -751,46 +1073,81 @@ class Storage:
         )
 
     async def finish_active_giveaway(
-        self, eligible_count: int | None = None
+        self,
+        eligible_count: int | None = None,
+        *,
+        expected_giveaway: Giveaway | None = None,
+    ) -> Giveaway | None:
+        async with self._giveaway_mutation_lock:
+            return await self._finish_active_giveaway_unlocked(
+                eligible_count, expected_giveaway=expected_giveaway
+            )
+
+    async def _finish_active_giveaway_unlocked(
+        self,
+        eligible_count: int | None = None,
+        *,
+        expected_giveaway: Giveaway | None = None,
     ) -> Giveaway | None:
         giveaway = await self.active_giveaway()
         if giveaway is None:
             return None
+        if expected_giveaway is not None and expected_giveaway.id != giveaway.id:
+            return None
         now = self.now()
-        rows = await (
+        expected_where = ""
+        update_values: list[int | str | None] = [now, eligible_count, giveaway.id]
+        if expected_giveaway is not None:
+            expected_where = (
+                " AND title = ? AND prize = ? AND winner_count = ?"
+                " AND min_participants = ? AND min_seconds = ? AND min_messages = ?"
+                " AND message_interval_seconds = ? AND end_at IS ?"
+            )
+            update_values.extend(
+                (
+                    expected_giveaway.title,
+                    expected_giveaway.prize,
+                    expected_giveaway.winner_count,
+                    expected_giveaway.min_participants,
+                    expected_giveaway.min_seconds,
+                    expected_giveaway.min_messages,
+                    expected_giveaway.message_interval_seconds,
+                    expected_giveaway.end_at,
+                )
+            )
+        try:
+            cursor = await self._db.execute(
+                """UPDATE giveaways
+                   SET state = 'finished', finished_at = ?, eligible_count_at_finish = ?,
+                       twitch_announce_enabled = 0, twitch_last_announce_at = NULL
+                   WHERE id = ? AND state = 'active'"""
+                + expected_where,
+                tuple(update_values),
+            )
+            if cursor.rowcount == 0:
+                await self._db.commit()
+                return None
+            rows = await (
+                await self._db.execute(
+                    """SELECT twitch_login FROM giveaway_activity
+                       WHERE giveaway_id = ? AND presence_started_at IS NOT NULL""",
+                    (giveaway.id,),
+                )
+            ).fetchall()
+            for row in rows:
+                await self._close_activity(giveaway.id, str(row["twitch_login"]), now)
+            await self._db.commit()
+        except Exception:
+            await self._db.rollback()
+            raise
+        row = await (
             await self._db.execute(
-                """SELECT twitch_login FROM giveaway_activity
-                   WHERE giveaway_id = ? AND presence_started_at IS NOT NULL""",
+                """SELECT id, state, title, prize, winner_count, min_participants, min_seconds, min_messages, message_interval_seconds, started_at, finished_at, eligible_count_at_finish, end_at, twitch_announce_enabled, twitch_announce_interval_seconds, twitch_last_announce_at
+                   FROM giveaways WHERE id = ? AND state = 'finished'""",
                 (giveaway.id,),
             )
-        ).fetchall()
-        for row in rows:
-            await self._close_activity(giveaway.id, str(row["twitch_login"]), now)
-        await self._db.execute(
-            """UPDATE giveaways
-               SET state = 'finished', finished_at = ?, eligible_count_at_finish = ?
-               WHERE id = ?""",
-            (now, eligible_count, giveaway.id),
-        )
-        await self._db.commit()
-        return Giveaway(
-            giveaway.id,
-            "finished",
-            giveaway.title,
-            giveaway.prize,
-            giveaway.winner_count,
-            giveaway.min_participants,
-            giveaway.min_seconds,
-            giveaway.min_messages,
-            giveaway.message_interval_seconds,
-            giveaway.started_at,
-            now,
-            eligible_count,
-            giveaway.end_at,
-            giveaway.twitch_announce_enabled,
-            giveaway.twitch_announce_interval_seconds,
-            giveaway.twitch_last_announce_at,
-        )
+        ).fetchone()
+        return self._giveaway_from_row(row)
 
     async def configure_twitch_announcements(
         self, *, enabled: bool, interval_minutes: int | None = None
@@ -1095,6 +1452,646 @@ class Storage:
             )
             for row in rows
         ]
+
+    async def draw_participants(
+        self,
+        giveaway: Giveaway,
+        excluded_twitch_logins: tuple[str, ...] = (),
+        excluded_telegram_usernames: tuple[str, ...] = (),
+    ) -> list[DrawParticipant]:
+        """Return every registration for membership checks before a draw.
+
+        This is only a preview. ``create_draw_round`` takes a fresh statistics
+        snapshot at its cutoff and refuses the draw if the registration set has
+        changed while Telegram membership was being checked.
+        """
+
+        return await self._draw_participants_at(
+            giveaway,
+            self.now(),
+            excluded_twitch_logins,
+            excluded_telegram_usernames,
+        )
+
+    async def _draw_participants_at(
+        self,
+        giveaway: Giveaway,
+        cutoff_at: int,
+        excluded_twitch_logins: tuple[str, ...],
+        excluded_telegram_usernames: tuple[str, ...],
+        *,
+        db: aiosqlite.Connection | None = None,
+    ) -> list[DrawParticipant]:
+        connection = db or self._db
+        rows = await (
+            await connection.execute(
+                """SELECT registration.telegram_user_id,
+                          registration.telegram_name,
+                          registration.telegram_username,
+                          registration.twitch_login,
+                          registration.twitch_user_id,
+                          registration.registered_at,
+                          COALESCE(activity.seconds, 0) +
+                              CASE WHEN activity.presence_started_at IS NULL THEN 0
+                                   ELSE MAX(0, ? - activity.presence_started_at) END
+                              AS seconds,
+                          COALESCE(activity.messages, 0) AS messages
+                   FROM giveaway_registrations AS registration
+                   LEFT JOIN giveaway_activity AS activity
+                     ON activity.giveaway_id = registration.giveaway_id
+                    AND activity.twitch_login = registration.twitch_login
+                   WHERE registration.giveaway_id = ?
+                   ORDER BY registration.registered_at,
+                            registration.telegram_user_id""",
+                (cutoff_at, giveaway.id),
+            )
+        ).fetchall()
+        excluded_twitch = set(self._excluded_logins(excluded_twitch_logins))
+        excluded_telegram = set(
+            self._excluded_telegram_usernames(excluded_telegram_usernames)
+        )
+        participants: list[DrawParticipant] = []
+        for row in rows:
+            twitch_login = str(row["twitch_login"])
+            telegram_username = (
+                str(row["telegram_username"])
+                if row["telegram_username"] is not None
+                else None
+            )
+            seconds = max(0, int(row["seconds"]))
+            messages = max(0, int(row["messages"]))
+            time_requirement_met = seconds >= giveaway.min_seconds
+            message_requirement_met = messages >= giveaway.min_messages
+            excluded_by_twitch = (
+                twitch_login.strip().casefold().lstrip("@") in excluded_twitch
+            )
+            excluded_by_telegram = (
+                telegram_username is not None
+                and telegram_username.strip().casefold().lstrip("@")
+                in excluded_telegram
+            )
+            reasons: list[str] = []
+            if not time_requirement_met:
+                reasons.append("not_enough_time")
+            if not message_requirement_met:
+                reasons.append("not_enough_messages")
+            if excluded_by_twitch:
+                reasons.append("excluded_twitch")
+            if excluded_by_telegram:
+                reasons.append("excluded_telegram")
+            participants.append(
+                DrawParticipant(
+                    telegram_user_id=int(row["telegram_user_id"]),
+                    telegram_name=str(row["telegram_name"]),
+                    telegram_username=telegram_username,
+                    twitch_login=twitch_login,
+                    twitch_user_id=str(row["twitch_user_id"]),
+                    registered_at=int(row["registered_at"]),
+                    seconds=seconds,
+                    messages=messages,
+                    time_requirement_met=time_requirement_met,
+                    message_requirement_met=message_requirement_met,
+                    excluded_by_twitch=excluded_by_twitch,
+                    excluded_by_telegram=excluded_by_telegram,
+                    eligibility_reason=",".join(reasons) or None,
+                )
+            )
+        return participants
+
+    async def create_draw_round(
+        self,
+        giveaway: Giveaway,
+        eligibility_by_telegram_id: Mapping[int, DrawEligibility | bool],
+        *,
+        reroll: bool = False,
+        force: bool = False,
+        excluded_twitch_logins: tuple[str, ...] = (),
+        excluded_telegram_usernames: tuple[str, ...] = (),
+        score_factory: Callable[[], int] | None = None,
+        finish: bool = True,
+    ) -> DrawResult:
+        """Persist one immutable draw and its winners in one transaction.
+
+        The first round snapshots and, by default, finishes the active giveaway.
+        A reroll always selects one new winner and excludes every winner already
+        recorded for the giveaway. Scores are unique within a round and are saved
+        for all registrations, including registrations that are not eligible.
+        """
+
+        if reroll and finish:
+            # A reroll operates on an already finished giveaway.
+            finish = False
+        normalized_eligibility = self._normalize_draw_eligibility(
+            eligibility_by_telegram_id
+        )
+        async with self._giveaway_mutation_lock:
+            return await self._create_draw_round_unlocked(
+                giveaway,
+                normalized_eligibility,
+                reroll=reroll,
+                force=force,
+                excluded_twitch_logins=excluded_twitch_logins,
+                excluded_telegram_usernames=excluded_telegram_usernames,
+                score_factory=score_factory,
+                finish=finish,
+            )
+
+    @staticmethod
+    def _normalize_draw_eligibility(
+        eligibility_by_telegram_id: Mapping[int, DrawEligibility | bool],
+    ) -> dict[int, DrawEligibility]:
+        normalized: dict[int, DrawEligibility] = {}
+        for telegram_user_id, value in eligibility_by_telegram_id.items():
+            if not isinstance(telegram_user_id, int) or isinstance(
+                telegram_user_id, bool
+            ):
+                raise ValueError("Telegram ID участника должен быть целым числом.")
+            decision = DrawEligibility(value) if isinstance(value, bool) else value
+            if not isinstance(decision, DrawEligibility) or not isinstance(
+                decision.telegram_member, bool
+            ):
+                raise ValueError("Для каждого участника нужен результат проверки Telegram.")
+            reason = decision.reason.strip() if decision.reason else None
+            if reason is not None and len(reason) > 500:
+                raise ValueError("Причина недопуска не должна быть длиннее 500 символов.")
+            normalized[telegram_user_id] = DrawEligibility(
+                telegram_member=decision.telegram_member,
+                reason=reason,
+            )
+        return normalized
+
+    async def _create_draw_round_unlocked(
+        self,
+        giveaway: Giveaway,
+        eligibility_by_telegram_id: dict[int, DrawEligibility],
+        *,
+        reroll: bool,
+        force: bool,
+        excluded_twitch_logins: tuple[str, ...],
+        excluded_telegram_usernames: tuple[str, ...],
+        score_factory: Callable[[], int] | None,
+        finish: bool,
+    ) -> DrawResult:
+        # A dedicated connection is essential here. Other handlers commit on
+        # ``self._db``; sharing that connection would let (for example) a chat
+        # message accidentally commit a half-written draw transaction.
+        draw_db = await aiosqlite.connect(self.path, timeout=30)
+        draw_db.row_factory = aiosqlite.Row
+        try:
+            await draw_db.execute("PRAGMA foreign_keys = ON")
+            await draw_db.execute("BEGIN IMMEDIATE")
+            row = await (
+                await draw_db.execute(
+                    """SELECT id, state, title, prize, winner_count, min_participants,
+                              min_seconds, min_messages, message_interval_seconds,
+                              started_at, finished_at, eligible_count_at_finish, end_at,
+                              twitch_announce_enabled,
+                              twitch_announce_interval_seconds,
+                              twitch_last_announce_at
+                       FROM giveaways WHERE id = ?""",
+                    (giveaway.id,),
+                )
+            ).fetchone()
+            current = self._giveaway_from_row(row)
+            if current is None:
+                raise ValueError("Розыгрыш не найден.")
+
+            if not reroll:
+                existing = await (
+                    await draw_db.execute(
+                        """SELECT id FROM giveaway_draw_rounds
+                           WHERE giveaway_id = ? AND round_kind = 'finish'
+                           ORDER BY round_number LIMIT 1""",
+                        (giveaway.id,),
+                    )
+                ).fetchone()
+                if existing is not None:
+                    if finish and current.state == "active":
+                        raise RuntimeError(
+                            "Снимок жеребьёвки уже создан, но розыгрыш ещё активен."
+                        )
+                    result = await self._draw_result_for_round_unlocked(
+                        int(existing["id"]), db=draw_db
+                    )
+                    await draw_db.commit()
+                    return result
+                other_round = await (
+                    await draw_db.execute(
+                        """SELECT 1 FROM giveaway_draw_rounds
+                           WHERE giveaway_id = ? LIMIT 1""",
+                        (giveaway.id,),
+                    )
+                ).fetchone()
+                if other_round is not None:
+                    raise ValueError(
+                        "Нельзя создать первую жеребьёвку после сохранённого reroll."
+                    )
+                if current.state != "active":
+                    raise ValueError("Розыгрыш уже завершён без снимка жеребьёвки.")
+                if not self._same_draw_rules(current, giveaway):
+                    raise ValueError(
+                        "Параметры розыгрыша изменились; повторите проверку участников."
+                    )
+            elif current.state != "finished":
+                raise ValueError("Повторная жеребьёвка доступна только после завершения.")
+
+            cutoff_at = self.now()
+            if finish:
+                await draw_db.execute(
+                    """UPDATE giveaway_activity
+                       SET seconds = seconds + MAX(0, ? - presence_started_at),
+                           presence_started_at = NULL
+                       WHERE giveaway_id = ? AND presence_started_at IS NOT NULL""",
+                    (cutoff_at, giveaway.id),
+                )
+
+            participants = await self._draw_participants_at(
+                current,
+                cutoff_at,
+                excluded_twitch_logins,
+                excluded_telegram_usernames,
+                db=draw_db,
+            )
+            registration_ids = {
+                participant.telegram_user_id for participant in participants
+            }
+            decision_ids = set(eligibility_by_telegram_id)
+            if decision_ids != registration_ids:
+                missing = sorted(registration_ids - decision_ids)
+                extra = sorted(decision_ids - registration_ids)
+                details: list[str] = []
+                if missing:
+                    details.append("не проверены: " + ", ".join(map(str, missing)))
+                if extra:
+                    details.append("лишние: " + ", ".join(map(str, extra)))
+                raise ValueError(
+                    "Список регистраций изменился после проверки Telegram ("
+                    + "; ".join(details)
+                    + ")."
+                )
+
+            winner_rows = await (
+                await draw_db.execute(
+                    """SELECT telegram_user_id FROM giveaway_winners
+                       WHERE giveaway_id = ?""",
+                    (giveaway.id,),
+                )
+            ).fetchall()
+            previous_winner_ids = {
+                int(winner_row["telegram_user_id"]) for winner_row in winner_rows
+            }
+            if reroll and not previous_winner_ids:
+                raise ValueError(
+                    "Повторная жеребьёвка доступна только после выбора хотя бы "
+                    "одного победителя в основном раунде."
+                )
+            if not reroll and previous_winner_ids:
+                raise ValueError(
+                    "Для розыгрыша уже записаны победители без снимка жеребьёвки."
+                )
+
+            scores = self._unique_draw_scores(len(participants), score_factory)
+            prepared: list[dict[str, object]] = []
+            for participant, random_score in zip(participants, scores, strict=True):
+                membership = eligibility_by_telegram_id[
+                    participant.telegram_user_id
+                ]
+                reasons: list[str] = []
+                if not participant.time_requirement_met:
+                    reasons.append("not_enough_time")
+                if not participant.message_requirement_met:
+                    reasons.append("not_enough_messages")
+                if participant.excluded_by_twitch:
+                    reasons.append("excluded_twitch")
+                if participant.excluded_by_telegram:
+                    reasons.append("excluded_telegram")
+                if not membership.telegram_member:
+                    reasons.append(membership.reason or "telegram_not_member")
+                previous_winner = (
+                    reroll
+                    and participant.telegram_user_id in previous_winner_ids
+                )
+                if previous_winner:
+                    reasons.append("previous_winner")
+                prepared.append(
+                    {
+                        "participant": participant,
+                        "telegram_member": membership.telegram_member,
+                        "previous_winner": previous_winner,
+                        "final_eligible": not reasons,
+                        "eligibility_reason": ",".join(reasons) or None,
+                        "random_score": random_score,
+                        "draw_rank": None,
+                        "winner_position": None,
+                    }
+                )
+
+            eligible = sorted(
+                (item for item in prepared if bool(item["final_eligible"])),
+                key=lambda item: int(item["random_score"]),
+                reverse=True,
+            )
+            if reroll and not eligible:
+                raise ValueError("Для повторной жеребьёвки нет допущенных участников.")
+            for rank, item in enumerate(eligible, 1):
+                item["draw_rank"] = rank
+
+            requested_winner_count = 1 if reroll else current.winner_count
+            min_participants_required = 1 if reroll else current.min_participants
+            min_participants_met = len(eligible) >= min_participants_required
+            selected = (
+                eligible[:requested_winner_count]
+                if force or min_participants_met
+                else []
+            )
+            position_row = await (
+                await draw_db.execute(
+                    """SELECT COALESCE(MAX(position), 0) AS last_position
+                       FROM giveaway_winners WHERE giveaway_id = ?""",
+                    (giveaway.id,),
+                )
+            ).fetchone()
+            first_winner_position = int(position_row["last_position"]) + 1
+            for offset, item in enumerate(selected):
+                item["winner_position"] = first_winner_position + offset
+
+            number_row = await (
+                await draw_db.execute(
+                    """SELECT COALESCE(MAX(round_number), 0) + 1 AS next_number
+                       FROM giveaway_draw_rounds WHERE giveaway_id = ?""",
+                    (giveaway.id,),
+                )
+            ).fetchone()
+            round_number = int(number_row["next_number"])
+            cursor = await draw_db.execute(
+                """INSERT INTO giveaway_draw_rounds
+                   (giveaway_id, round_number, round_kind, cutoff_at, created_at,
+                    forced, requested_winner_count, registered_count,
+                    eligible_count, min_participants_required,
+                    min_participants_met, title, prize, min_seconds, min_messages)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    giveaway.id,
+                    round_number,
+                    "reroll" if reroll else "finish",
+                    cutoff_at,
+                    cutoff_at,
+                    int(force),
+                    requested_winner_count,
+                    len(prepared),
+                    len(eligible),
+                    min_participants_required,
+                    int(min_participants_met),
+                    current.title,
+                    current.prize,
+                    current.min_seconds,
+                    current.min_messages,
+                ),
+            )
+            round_id = int(cursor.lastrowid)
+            await draw_db.executemany(
+                """INSERT INTO giveaway_draw_entries
+                   (round_id, giveaway_id, telegram_user_id, telegram_name,
+                    telegram_username, twitch_login, twitch_user_id, registered_at,
+                    seconds, messages, time_requirement_met,
+                    message_requirement_met, excluded_by_twitch,
+                    excluded_by_telegram, telegram_member, previous_winner,
+                    final_eligible, eligibility_reason, random_score, draw_rank,
+                    winner_position)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        round_id,
+                        giveaway.id,
+                        participant.telegram_user_id,
+                        participant.telegram_name,
+                        participant.telegram_username,
+                        participant.twitch_login,
+                        participant.twitch_user_id,
+                        participant.registered_at,
+                        participant.seconds,
+                        participant.messages,
+                        int(participant.time_requirement_met),
+                        int(participant.message_requirement_met),
+                        int(participant.excluded_by_twitch),
+                        int(participant.excluded_by_telegram),
+                        int(bool(item["telegram_member"])),
+                        int(bool(item["previous_winner"])),
+                        int(bool(item["final_eligible"])),
+                        item["eligibility_reason"],
+                        int(item["random_score"]),
+                        item["draw_rank"],
+                        item["winner_position"],
+                    )
+                    for item in prepared
+                    for participant in (item["participant"],)
+                ],
+            )
+            if selected:
+                await draw_db.executemany(
+                    """INSERT INTO giveaway_winners
+                       (giveaway_id, telegram_user_id, drawn_at, position)
+                       VALUES (?, ?, ?, ?)""",
+                    [
+                        (
+                            giveaway.id,
+                            item["participant"].telegram_user_id,
+                            cutoff_at,
+                            item["winner_position"],
+                        )
+                        for item in selected
+                    ],
+                )
+            if finish:
+                finish_cursor = await draw_db.execute(
+                    """UPDATE giveaways
+                       SET state = 'finished', finished_at = ?,
+                           eligible_count_at_finish = ?,
+                           twitch_announce_enabled = 0,
+                           twitch_last_announce_at = NULL
+                       WHERE id = ? AND state = 'active'""",
+                    (cutoff_at, len(eligible), giveaway.id),
+                )
+                if finish_cursor.rowcount != 1:
+                    raise RuntimeError("Не удалось атомарно завершить розыгрыш.")
+            await draw_db.commit()
+            return await self._draw_result_for_round_unlocked(round_id, db=draw_db)
+        except Exception:
+            await draw_db.rollback()
+            raise
+        finally:
+            await draw_db.close()
+
+    @staticmethod
+    def _same_draw_rules(current: Giveaway, expected: Giveaway) -> bool:
+        return (
+            current.id,
+            current.title,
+            current.prize,
+            current.winner_count,
+            current.min_participants,
+            current.min_seconds,
+            current.min_messages,
+            current.message_interval_seconds,
+            current.end_at,
+        ) == (
+            expected.id,
+            expected.title,
+            expected.prize,
+            expected.winner_count,
+            expected.min_participants,
+            expected.min_seconds,
+            expected.min_messages,
+            expected.message_interval_seconds,
+            expected.end_at,
+        )
+
+    @staticmethod
+    def _unique_draw_scores(
+        count: int, score_factory: Callable[[], int] | None
+    ) -> list[int]:
+        factory = score_factory or (lambda: secrets.randbelow(DRAW_SCORE_MAX + 1))
+        scores: list[int] = []
+        seen: set[int] = set()
+        max_attempts = max(1_000, count * 100)
+        attempts = 0
+        while len(scores) < count:
+            attempts += 1
+            if attempts > max_attempts:
+                raise RuntimeError("Не удалось сгенерировать уникальные случайные баллы.")
+            score = factory()
+            if not isinstance(score, int) or isinstance(score, bool):
+                raise ValueError("Случайный балл должен быть целым числом.")
+            if not 0 <= score <= DRAW_SCORE_MAX:
+                raise ValueError("Случайный балл должен содержать не более 12 цифр.")
+            if score in seen:
+                continue
+            seen.add(score)
+            scores.append(score)
+        return scores
+
+    async def draw_rounds(self, giveaway: Giveaway | int) -> list[DrawRound]:
+        giveaway_id = giveaway.id if isinstance(giveaway, Giveaway) else giveaway
+        rows = await (
+            await self._db.execute(
+                """SELECT * FROM giveaway_draw_rounds
+                   WHERE giveaway_id = ? ORDER BY round_number""",
+                (giveaway_id,),
+            )
+        ).fetchall()
+        return [self._draw_round_from_row(row) for row in rows]
+
+    async def draw_entries(self, round_id: int) -> list[DrawEntry]:
+        return list(await self._draw_entries_for_round_unlocked(round_id))
+
+    async def latest_draw_result(
+        self, giveaway: Giveaway | int
+    ) -> DrawResult | None:
+        giveaway_id = giveaway.id if isinstance(giveaway, Giveaway) else giveaway
+        row = await (
+            await self._db.execute(
+                """SELECT id FROM giveaway_draw_rounds
+                   WHERE giveaway_id = ? ORDER BY round_number DESC LIMIT 1""",
+                (giveaway_id,),
+            )
+        ).fetchone()
+        if row is None:
+            return None
+        return await self._draw_result_for_round_unlocked(int(row["id"]))
+
+    async def _draw_result_for_round_unlocked(
+        self, round_id: int, *, db: aiosqlite.Connection | None = None
+    ) -> DrawResult:
+        connection = db or self._db
+        row = await (
+            await connection.execute(
+                "SELECT * FROM giveaway_draw_rounds WHERE id = ?", (round_id,)
+            )
+        ).fetchone()
+        if row is None:
+            raise ValueError("Раунд жеребьёвки не найден.")
+        draw_round = self._draw_round_from_row(row)
+        entries = await self._draw_entries_for_round_unlocked(round_id, db=connection)
+        winners = tuple(
+            sorted(
+                (entry for entry in entries if entry.winner_position is not None),
+                key=lambda entry: int(entry.winner_position or 0),
+            )
+        )
+        return DrawResult(round=draw_round, entries=entries, winners=winners)
+
+    async def _draw_entries_for_round_unlocked(
+        self, round_id: int, *, db: aiosqlite.Connection | None = None
+    ) -> tuple[DrawEntry, ...]:
+        connection = db or self._db
+        rows = await (
+            await connection.execute(
+                """SELECT * FROM giveaway_draw_entries WHERE round_id = ?
+                   ORDER BY CASE WHEN draw_rank IS NULL THEN 1 ELSE 0 END,
+                            draw_rank, telegram_user_id""",
+                (round_id,),
+            )
+        ).fetchall()
+        return tuple(self._draw_entry_from_row(row) for row in rows)
+
+    @staticmethod
+    def _draw_round_from_row(row: aiosqlite.Row) -> DrawRound:
+        return DrawRound(
+            id=int(row["id"]),
+            giveaway_id=int(row["giveaway_id"]),
+            round_number=int(row["round_number"]),
+            round_kind=str(row["round_kind"]),
+            cutoff_at=int(row["cutoff_at"]),
+            created_at=int(row["created_at"]),
+            forced=bool(row["forced"]),
+            requested_winner_count=int(row["requested_winner_count"]),
+            registered_count=int(row["registered_count"]),
+            eligible_count=int(row["eligible_count"]),
+            min_participants_required=int(row["min_participants_required"]),
+            min_participants_met=bool(row["min_participants_met"]),
+            title=str(row["title"]),
+            prize=str(row["prize"]),
+            min_seconds=int(row["min_seconds"]),
+            min_messages=int(row["min_messages"]),
+        )
+
+    @staticmethod
+    def _draw_entry_from_row(row: aiosqlite.Row) -> DrawEntry:
+        return DrawEntry(
+            round_id=int(row["round_id"]),
+            giveaway_id=int(row["giveaway_id"]),
+            telegram_user_id=int(row["telegram_user_id"]),
+            telegram_name=str(row["telegram_name"]),
+            telegram_username=(
+                str(row["telegram_username"])
+                if row["telegram_username"] is not None
+                else None
+            ),
+            twitch_login=str(row["twitch_login"]),
+            twitch_user_id=str(row["twitch_user_id"]),
+            registered_at=int(row["registered_at"]),
+            seconds=int(row["seconds"]),
+            messages=int(row["messages"]),
+            time_requirement_met=bool(row["time_requirement_met"]),
+            message_requirement_met=bool(row["message_requirement_met"]),
+            excluded_by_twitch=bool(row["excluded_by_twitch"]),
+            excluded_by_telegram=bool(row["excluded_by_telegram"]),
+            telegram_member=bool(row["telegram_member"]),
+            previous_winner=bool(row["previous_winner"]),
+            final_eligible=bool(row["final_eligible"]),
+            eligibility_reason=(
+                str(row["eligibility_reason"])
+                if row["eligibility_reason"] is not None
+                else None
+            ),
+            random_score=str(int(row["random_score"])),
+            draw_rank=int(row["draw_rank"]) if row["draw_rank"] is not None else None,
+            winner_position=(
+                int(row["winner_position"])
+                if row["winner_position"] is not None
+                else None
+            ),
+        )
 
     async def record_winner(self, giveaway_id: int, telegram_user_id: int) -> None:
         row = await (

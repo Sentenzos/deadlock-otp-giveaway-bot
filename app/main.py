@@ -15,10 +15,27 @@ from aiogram.enums import ChatType, ParseMode
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart
 from aiogram.filters.command import CommandObject
-from aiogram.types import BotCommand, BotCommandScopeChat, Message
+from aiogram.types import BotCommand, BotCommandScopeChat, BufferedInputFile, Message
 
 from .config import Settings
-from .storage import Candidate, Giveaway, Storage
+from .giveaway_report import (
+    RESULT_NOT_ELIGIBLE,
+    RESULT_NOT_SELECTED,
+    RESULT_WINNER,
+    GiveawayReportMetadata,
+    GiveawayReportParticipant,
+    GiveawayReportRound,
+    build_giveaway_report,
+)
+from .storage import (
+    Candidate,
+    DrawEligibility,
+    DrawEntry,
+    DrawParticipant,
+    DrawResult,
+    Giveaway,
+    Storage,
+)
 from .twitch_announce import TwitchGiveawayAnnouncer
 from .twitch_chat import TwitchChat, TwitchChatState, TwitchLiveMonitor
 
@@ -32,6 +49,42 @@ PUBLIC_COMMAND_COOLDOWNS_SECONDS = {
 }
 LAST_STREAM_OFFLINE_STATE_KEY = "last_stream_offline_at"
 LAST_ANNOUNCED_STREAM_STATE_KEY = "last_announced_stream_started_at"
+GIVEAWAY_EDIT_FIELD_ALIASES = {
+    "minutes": "min_minutes",
+    "min_minutes": "min_minutes",
+    "минуты": "min_minutes",
+    "время": "min_minutes",
+    "messages": "min_messages",
+    "min_messages": "min_messages",
+    "сообщения": "min_messages",
+    "winners": "winner_count",
+    "winner_count": "winner_count",
+    "победители": "winner_count",
+    "interval": "message_interval_seconds",
+    "message_interval": "message_interval_seconds",
+    "интервал": "message_interval_seconds",
+    "participants": "min_participants",
+    "min_participants": "min_participants",
+    "участники": "min_participants",
+    "end": "end_at",
+    "date": "end_at",
+    "завершение": "end_at",
+    "title": "title",
+    "name": "title",
+    "название": "title",
+    "prize": "prize",
+    "reward": "prize",
+    "награда": "prize",
+}
+GIVEAWAY_EDIT_CLEAR_VALUES = {
+    "clear",
+    "none",
+    "remove",
+    "очистить",
+    "убрать",
+    "нет",
+    "-",
+}
 ConfigureTwitchAnnouncements = Callable[
     [bool, int | None], Awaitable[Giveaway | None]
 ]
@@ -212,6 +265,185 @@ async def group_candidates(
     ]
 
 
+class TelegramMembershipCheckError(RuntimeError):
+    """The draw must remain unchanged until Telegram membership can be verified."""
+
+
+async def draw_membership_decisions(
+    bot: Bot,
+    settings: Settings,
+    participants: list[DrawParticipant],
+) -> dict[int, DrawEligibility]:
+    decisions: dict[int, DrawEligibility] = {}
+    for participant in participants:
+        try:
+            member = await bot.get_chat_member(
+                settings.telegram_required_chat_id,
+                participant.telegram_user_id,
+            )
+        except TelegramAPIError as error:
+            logger.warning(
+                "Не удалось проверить участника Telegram %s перед жеребьёвкой",
+                participant.telegram_user_id,
+                exc_info=True,
+            )
+            raise TelegramMembershipCheckError(
+                "Telegram временно не позволил проверить членство участников."
+            ) from error
+        is_member = member.status in {
+            "creator",
+            "owner",
+            "administrator",
+            "member",
+        } or (
+            member.status == "restricted"
+            and bool(getattr(member, "is_member", False))
+        )
+        decisions[participant.telegram_user_id] = DrawEligibility(
+            telegram_member=is_member,
+            reason=None if is_member else "telegram_not_member",
+        )
+    return decisions
+
+
+async def create_persisted_draw(
+    bot: Bot,
+    settings: Settings,
+    storage: Storage,
+    giveaway: Giveaway,
+    *,
+    reroll: bool = False,
+    force: bool = False,
+) -> DrawResult:
+    participants = await storage.draw_participants(
+        giveaway,
+        settings.twitch_excluded_logins,
+        settings.telegram_excluded_usernames,
+    )
+    decisions = await draw_membership_decisions(bot, settings, participants)
+    return await storage.create_draw_round(
+        giveaway,
+        decisions,
+        reroll=reroll,
+        force=force,
+        excluded_twitch_logins=settings.twitch_excluded_logins,
+        excluded_telegram_usernames=settings.telegram_excluded_usernames,
+        finish=not reroll,
+    )
+
+
+def draw_entry_candidate(entry: DrawEntry) -> Candidate:
+    return Candidate(
+        telegram_user_id=entry.telegram_user_id,
+        telegram_name=entry.telegram_name,
+        telegram_username=entry.telegram_username,
+        twitch_login=entry.twitch_login,
+        seconds=entry.seconds,
+        messages=entry.messages,
+    )
+
+
+def giveaway_report_participant(entry: DrawEntry) -> GiveawayReportParticipant:
+    if entry.winner_position is not None:
+        result = RESULT_WINNER
+    elif entry.final_eligible:
+        result = RESULT_NOT_SELECTED
+    else:
+        result = RESULT_NOT_ELIGIBLE
+    return GiveawayReportParticipant(
+        twitch_login=entry.twitch_login,
+        minutes=entry.seconds / 60,
+        messages=entry.messages,
+        admitted=entry.final_eligible,
+        random_number=entry.random_score,
+        eligible_place=entry.draw_rank,
+        result=result,
+    )
+
+
+async def persisted_giveaway_report(
+    storage: Storage, giveaway: Giveaway
+) -> tuple[bytes, int] | None:
+    rounds = await storage.draw_rounds(giveaway)
+    if not rounds:
+        return None
+    report_rounds: list[GiveawayReportRound] = []
+    for draw_round in rounds:
+        entries = await storage.draw_entries(draw_round.id)
+        report_rounds.append(
+            GiveawayReportRound(
+                draw_round=draw_round.round_number,
+                forced=draw_round.forced,
+                participants=tuple(
+                    giveaway_report_participant(entry) for entry in entries
+                ),
+            )
+        )
+    initial_round = rounds[0]
+    metadata = GiveawayReportMetadata(
+        giveaway_id=giveaway.id,
+        title=initial_round.title,
+        prize=initial_round.prize,
+        min_minutes=initial_round.min_seconds / 60,
+        min_messages=initial_round.min_messages,
+        winner_count=initial_round.requested_winner_count,
+        min_participants=initial_round.min_participants_required,
+        message_interval_seconds=giveaway.message_interval_seconds,
+        started_at=giveaway.started_at,
+        end_at=giveaway.end_at,
+        finished_at=giveaway.finished_at or initial_round.cutoff_at,
+        eligible_count=(
+            giveaway.eligible_count_at_finish
+            if giveaway.eligible_count_at_finish is not None
+            else initial_round.eligible_count
+        ),
+    )
+    report_bytes = await asyncio.to_thread(
+        build_giveaway_report,
+        metadata,
+        tuple(report_rounds),
+    )
+    return report_bytes, rounds[-1].round_number
+
+
+async def send_persisted_giveaway_report(
+    bot: Bot,
+    storage: Storage,
+    giveaway: Giveaway,
+    chat_id: int,
+) -> bool | None:
+    try:
+        prepared = await persisted_giveaway_report(storage, giveaway)
+        if prepared is None:
+            return None
+        report_bytes, latest_round = prepared
+        if len(report_bytes) > 49 * 1024 * 1024:
+            raise RuntimeError("XLSX-отчёт превышает безопасный размер Telegram-документа.")
+        await bot.send_document(
+            chat_id=chat_id,
+            document=BufferedInputFile(
+                report_bytes,
+                filename=f"giveaway_{giveaway.id}_results.xlsx",
+            ),
+            caption=(
+                "📊 <b>Публичный протокол жеребьёвки</b>\n"
+                f"Розыгрыш: <b>{html.escape(giveaway.title)}</b>\n"
+                f"Сохранено раундов: <b>{latest_round}</b>. "
+                "Telegram-ники и Telegram ID в файле отсутствуют."
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return True
+    except Exception:
+        logger.warning(
+            "Не удалось сформировать или отправить XLSX розыгрыша %s в Telegram %s",
+            giveaway.id,
+            chat_id,
+            exc_info=True,
+        )
+        return False
+
+
 def is_owner_command(message: Message, settings: Settings) -> bool:
     return (
         message.from_user is not None
@@ -333,6 +565,72 @@ def parse_start_args(
         end_at,
         title,
         prize,
+    )
+
+
+def parse_edit_args(raw_args: str) -> tuple[str, int | str | None]:
+    parts = raw_args.split(maxsplit=2)
+    if len(parts) < 2:
+        raise ValueError("Укажите параметр, который нужно изменить.")
+    requested_field = parts[1].casefold()
+    field = GIVEAWAY_EDIT_FIELD_ALIASES.get(requested_field)
+    if field is None:
+        raise ValueError(
+            f"Неизвестный параметр «{parts[1]}». Доступны: minutes, messages, "
+            "winners, interval, participants, end, title и prize."
+        )
+    if len(parts) < 3 or not parts[2].strip():
+        if field == "end_at":
+            raise ValueError(
+                "Укажите дату и время завершения либо clear для удаления даты."
+            )
+        if field == "prize":
+            raise ValueError("Укажите новую награду либо clear для её удаления.")
+        raise ValueError("Укажите новое значение параметра.")
+
+    value_text = parts[2].strip()
+    if field in {
+        "min_minutes",
+        "min_messages",
+        "winner_count",
+        "message_interval_seconds",
+        "min_participants",
+    }:
+        if len(value_text.split()) != 1:
+            raise ValueError("Для числового параметра укажите ровно одно целое число.")
+        try:
+            return field, int(value_text)
+        except ValueError as error:
+            raise ValueError("Значение параметра должно быть целым числом.") from error
+
+    if field == "end_at":
+        if value_text.casefold() in GIVEAWAY_EDIT_CLEAR_VALUES:
+            return field, None
+        date_parts = value_text.split()
+        if len(date_parts) != 2:
+            raise ValueError(
+                "Дата завершения указывается как ДД.ММ.ГГГГ ЧЧ:ММ либо clear."
+            )
+        return field, parse_giveaway_end_at(date_parts[0], date_parts[1])
+
+    if field == "prize" and value_text.casefold() in GIVEAWAY_EDIT_CLEAR_VALUES:
+        return field, ""
+    return field, value_text
+
+
+def giveaway_edit_usage() -> str:
+    return (
+        "Использование:\n"
+        "<code>/giveaway edit minutes 100</code>\n"
+        "<code>/giveaway edit messages 10</code>\n"
+        "<code>/giveaway edit winners 1</code>\n"
+        "<code>/giveaway edit interval 600</code>\n"
+        "<code>/giveaway edit participants 10</code>\n"
+        "<code>/giveaway edit end ДД.ММ.ГГГГ ЧЧ:ММ</code> или "
+        "<code>/giveaway edit end clear</code>\n"
+        "<code>/giveaway edit title Новое название</code>\n"
+        "<code>/giveaway edit prize Новая награда</code> или "
+        "<code>/giveaway edit prize clear</code>"
     )
 
 
@@ -464,6 +762,101 @@ def giveaway_created_text(giveaway: Giveaway) -> str:
         "Чтобы опубликовать старт в канал/чат, используйте "
         "<code>/giveaway announce_start</code>."
         )
+    )
+
+
+def giveaway_parameter_value(
+    giveaway: Giveaway, parameter: str
+) -> int | str | None:
+    values: dict[str, int | str | None] = {
+        "min_minutes": giveaway.min_seconds // 60,
+        "min_messages": giveaway.min_messages,
+        "winner_count": giveaway.winner_count,
+        "message_interval_seconds": giveaway.message_interval_seconds,
+        "min_participants": giveaway.min_participants,
+        "end_at": giveaway.end_at,
+        "title": giveaway.title,
+        "prize": giveaway.prize,
+    }
+    return values[parameter]
+
+
+def giveaway_rules_signature(giveaway: Giveaway) -> tuple[object, ...]:
+    return (
+        giveaway.title,
+        giveaway.prize,
+        giveaway.winner_count,
+        giveaway.min_participants,
+        giveaway.min_seconds,
+        giveaway.min_messages,
+        giveaway.message_interval_seconds,
+        giveaway.end_at,
+    )
+
+
+def giveaway_parameter_display(giveaway: Giveaway, parameter: str) -> str:
+    value = giveaway_parameter_value(giveaway, parameter)
+    if parameter == "min_minutes":
+        return f"{value} мин"
+    if parameter == "min_messages":
+        return f"{value} сообщений"
+    if parameter == "winner_count":
+        return f"{value}"
+    if parameter == "message_interval_seconds":
+        return f"{value} сек"
+    if parameter == "min_participants":
+        return f"{value}"
+    if parameter == "end_at":
+        return giveaway_datetime_text(value) if isinstance(value, int) else "не задано"
+    if parameter == "prize":
+        return html.escape(str(value)) if value else "не указана"
+    return html.escape(str(value))
+
+
+def giveaway_updated_text(
+    previous: Giveaway,
+    updated: Giveaway,
+    parameter: str,
+    finish_confirmation_cancelled: bool = False,
+) -> str:
+    labels = {
+        "min_minutes": "Минимальное время",
+        "min_messages": "Минимум сообщений",
+        "winner_count": "Количество победителей",
+        "message_interval_seconds": "Интервал между сообщениями",
+        "min_participants": "Минимум допущенных участников",
+        "end_at": "Плановое завершение",
+        "title": "Название",
+        "prize": "Награда",
+    }
+    changed = giveaway_parameter_value(previous, parameter) != giveaway_parameter_value(
+        updated, parameter
+    )
+    if not changed:
+        return (
+            "ℹ️ Параметр уже имеет указанное значение.\n\n"
+            f"{labels[parameter]}: <b>{giveaway_parameter_display(updated, parameter)}</b>."
+        )
+    extra = ""
+    if parameter == "message_interval_seconds":
+        extra = (
+            "\nНовый интервал применяется только к будущим сообщениям; ранее "
+            "засчитанные сообщения не пересчитываются."
+        )
+    if finish_confirmation_cancelled:
+        extra += (
+            "\nПредыдущее подтверждение завершения отменено. Чтобы завершить "
+            "розыгрыш, снова выполните <code>/giveaway finish</code>."
+        )
+    return (
+        "✅ <b>Параметр активного розыгрыша обновлён</b>\n"
+        f"{labels[parameter]}: "
+        f"<b>{giveaway_parameter_display(previous, parameter)}</b> → "
+        f"<b>{giveaway_parameter_display(updated, parameter)}</b>.\n\n"
+        "Накопленные минуты, сообщения и регистрации участников сохранены."
+        f"{extra}\n\n"
+        "Уже опубликованный Telegram-анонс не изменится автоматически. "
+        "При необходимости отправьте <code>/giveaway announce_start</code> повторно."
     )
 
 
@@ -608,6 +1001,7 @@ def owner_bot_commands() -> list[BotCommand]:
         BotCommand(command="viewers", description="Участники Twitch-чата сейчас"),
         BotCommand(command="twitch_announce", description="Анонсы розыгрыша в Twitch"),
         BotCommand(command="giveaway_create", description="Создать розыгрыш"),
+        BotCommand(command="giveaway_edit", description="Изменить параметры розыгрыша"),
         BotCommand(command="giveaway_announce_start", description="Анонсировать старт"),
         BotCommand(command="giveaway_status", description="Статистика розыгрыша"),
         BotCommand(command="giveaway_participants", description="Участники розыгрыша"),
@@ -629,7 +1023,7 @@ def build_router(
     validate_twitch_chat_send: ValidateTwitchChatSend | None = None,
 ) -> Router:
     router = Router(name="giveaway")
-    finish_confirmations: dict[int, tuple[int, float]] = {}
+    finish_confirmations: dict[int, tuple[int, float, tuple[object, ...]]] = {}
     public_command_timestamps: dict[tuple[int, str], float] = {}
 
     async def check_public_cooldown(message: Message, command: str) -> bool:
@@ -856,6 +1250,44 @@ def build_router(
                 await message.answer(str(error))
                 return
             await message.answer(giveaway_created_text(giveaway), parse_mode=ParseMode.HTML)
+            return
+
+        if action in {"edit", "update", "set"}:
+            giveaway = await storage.active_giveaway()
+            if giveaway is None:
+                await message.answer("Сейчас нет активного розыгрыша для изменения.")
+                return
+            try:
+                parameter, value = parse_edit_args(raw_args)
+                updated = await storage.update_active_giveaway(
+                    **{parameter: value}
+                )
+            except ValueError as error:
+                await message.answer(
+                    f"{giveaway_edit_usage()}\n\n<b>Ошибка:</b> {html.escape(str(error))}",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            if updated is None:
+                await message.answer("Активный розыгрыш уже завершён и не был изменён.")
+                return
+            changed = giveaway_parameter_value(
+                giveaway, parameter
+            ) != giveaway_parameter_value(updated, parameter)
+            confirmation_cancelled = False
+            if changed and message.from_user is not None:
+                confirmation_cancelled = (
+                    finish_confirmations.pop(message.from_user.id, None) is not None
+                )
+            await message.answer(
+                giveaway_updated_text(
+                    giveaway,
+                    updated,
+                    parameter,
+                    finish_confirmation_cancelled=confirmation_cancelled,
+                ),
+                parse_mode=ParseMode.HTML,
+            )
             return
 
         if action in {"announce_start", "announce-start", "announce"}:
@@ -1110,7 +1542,11 @@ def build_router(
                     )
                     return
                 if confirmation != "confirm":
-                    finish_confirmations[owner_id] = (giveaway.id, time.time() + 120)
+                    finish_confirmations[owner_id] = (
+                        giveaway.id,
+                        time.time() + 120,
+                        giveaway_rules_signature(giveaway),
+                    )
                     if force_finish:
                         confirmation_text = (
                             "Будет проигнорирован только минимальный размер списка участников. "
@@ -1142,60 +1578,115 @@ def build_router(
                     pending is None
                     or pending[0] != giveaway.id
                     or pending[1] < time.time()
+                    or pending[2] != giveaway_rules_signature(giveaway)
                 ):
                     await message.answer(
-                        "Нет действующего подтверждения или истекли две минуты. "
+                        "Нет действующего подтверждения, изменились параметры розыгрыша "
+                        "или истекли две минуты. "
                         "Сначала снова отправьте <code>/giveaway_finish</code>.",
                         parse_mode=ParseMode.HTML,
                     )
                     return
-                candidates = await group_candidates(bot, settings, storage, giveaway)
-                if configure_twitch_announcements is not None:
-                    await configure_twitch_announcements(False, None)
-                else:
-                    await storage.configure_twitch_announcements(enabled=False)
-                finished_giveaway = await storage.finish_active_giveaway(len(candidates))
-                if finished_giveaway is None:
-                    await message.answer("Не удалось завершить активный розыгрыш.")
-                    return
-                giveaway = finished_giveaway
-                if len(candidates) < giveaway.min_participants and not force_finish:
+                try:
+                    draw_result = await create_persisted_draw(
+                        bot,
+                        settings,
+                        storage,
+                        giveaway,
+                        force=force_finish,
+                    )
+                except TelegramMembershipCheckError:
                     await message.answer(
-                        f"Розыгрыш завершён без победителей: допущенных участников "
-                        f"<b>{len(candidates)}</b>, а для выбора требовалось не менее "
-                        f"<b>{giveaway.min_participants}</b>.\n\n"
-                        "Чтобы опубликовать завершение в канал/чат, используйте "
-                        "<code>/giveaway announce_finish</code>.",
+                        "Не удалось проверить членство участников в Telegram. "
+                        "Розыгрыш остаётся активным, статистика и регистрации сохранены. "
+                        "Повторите <code>/giveaway_finish</code> немного позже.",
                         parse_mode=ParseMode.HTML,
                     )
                     return
+                except (ValueError, RuntimeError):
+                    logger.warning(
+                        "Не удалось атомарно завершить розыгрыш %s",
+                        giveaway.id,
+                        exc_info=True,
+                    )
+                    await message.answer(
+                        "Не удалось зафиксировать жеребьёвку: параметры или список "
+                        "регистраций изменились во время проверки. Если розыгрыш ещё "
+                        "активен, снова выполните <code>/giveaway_finish</code>. "
+                        "Неподтверждённые результаты не сохранялись.",
+                        parse_mode=ParseMode.HTML,
+                    )
+                    return
+                if configure_twitch_announcements is not None:
+                    await configure_twitch_announcements(False, None)
             else:
                 giveaway = await storage.latest_finished_giveaway()
                 if giveaway is None:
                     await message.answer("Нет завершённого розыгрыша для перевыбора.")
                     return
-                candidates = await group_candidates(bot, settings, storage, giveaway)
-            if not candidates:
-                if action == "finish":
+                try:
+                    draw_result = await create_persisted_draw(
+                        bot,
+                        settings,
+                        storage,
+                        giveaway,
+                        reroll=True,
+                    )
+                except TelegramMembershipCheckError:
                     await message.answer(
-                        "Розыгрыш завершён без победителей: нет ни одного допущенного "
-                        "участника, который выполнил условия и состоит в нужном "
-                        "Telegram-канале/чате. Принудительный режим может игнорировать "
-                        "только установленный минимум участников.\n\n"
-                        "Чтобы опубликовать завершение, используйте "
-                        "<code>/giveaway announce_finish</code>.",
-                        parse_mode=ParseMode.HTML,
+                        "Не удалось проверить членство участников в Telegram. "
+                        "Новый раунд не создавался; повторите команду позже."
                     )
                     return
+                except (ValueError, RuntimeError):
+                    logger.info(
+                        "Повторная жеребьёвка розыгрыша %s не состоялась",
+                        giveaway.id,
+                        exc_info=True,
+                    )
+                    await message.answer(
+                        "Подходящих участников не осталось, либо список регистраций "
+                        "изменился во время проверки. Повторная жеребьёвка не "
+                        "проводилась, новый раунд не создавался."
+                    )
+                    return
+
+            winners = [draw_entry_candidate(entry) for entry in draw_result.winners]
+            report_status = await send_persisted_giveaway_report(
+                bot,
+                storage,
+                giveaway,
+                settings.owner_telegram_id,
+            )
+            report_warning = (
+                "\n\n⚠️ XLSX-отчёт не удалось отправить владельцу. "
+                "Результаты жеребьёвки сохранены; файл можно повторно получить через "
+                "анонс завершения."
+                if report_status is False
+                else ""
+            )
+            if not winners:
+                if draw_result.round.eligible_count == 0:
+                    reason = (
+                        "нет ни одного допущенного участника, который выполнил "
+                        "условия и состоит в нужном Telegram-канале/чате"
+                    )
+                else:
+                    reason = (
+                        f"допущенных участников <b>{draw_result.round.eligible_count}</b>, "
+                        "а для выбора требовалось не менее "
+                        f"<b>{draw_result.round.min_participants_required}</b>"
+                    )
                 await message.answer(
-                    "Подходящих участников не осталось: нужны привязанный Twitch, выполненные условия "
-                    "и действующая подписка/членство в нужном Telegram-канале или чате."
+                    f"Розыгрыш завершён без победителей: {reason}.\n\n"
+                    "Случайные числа и итоговая статистика всех зарегистрированных "
+                    "сохранены в XLSX. Чтобы опубликовать завершение и таблицу в "
+                    "канал/чат, используйте <code>/giveaway announce_finish</code>."
+                    f"{report_warning}",
+                    parse_mode=ParseMode.HTML,
                 )
                 return
-            winner_target = giveaway.winner_count if action == "finish" else 1
-            winners = pick_winners(candidates, winner_target)
-            for winner in winners:
-                await storage.record_winner(giveaway.id, winner.telegram_user_id)
+
             failed_notifications = await notify_winners(bot, giveaway, winners)
             prefix = "🏆 <b>Победители</b>" if action == "finish" else "🔄 <b>Новый победитель</b>"
             winner_lines = format_winner_lines(winners)
@@ -1208,16 +1699,35 @@ def build_router(
                 )
             else:
                 winner_lines.append("✅ Личные уведомления победителям отправлены.")
-            winner_lines.append(f"Кандидатов после проверки Telegram-канала/чата: {len(candidates)}.")
-            if action == "finish" and force_finish and len(candidates) < giveaway.min_participants:
+            winner_lines.append(
+                "Кандидатов после проверки Telegram-канала/чата: "
+                f"{draw_result.round.eligible_count}."
+            )
+            if (
+                action == "finish"
+                and force_finish
+                and not draw_result.round.min_participants_met
+            ):
                 winner_lines.append(
                     "⚠️ Минимум участников не достигнут: победители выбраны "
                     "в принудительном режиме."
                 )
-            if action == "finish" and len(winners) < giveaway.winner_count:
+            if (
+                action == "finish"
+                and len(winners) < draw_result.round.requested_winner_count
+            ):
                 winner_lines.append(
-                    f"Запрошено победителей: {giveaway.winner_count}, "
+                    "Запрошено победителей: "
+                    f"{draw_result.round.requested_winner_count}, "
                     f"подходящих кандидатов нашлось: {len(winners)}."
+                )
+            winner_lines.append(
+                "📊 Случайные числа и статистика всех зарегистрированных "
+                f"сохранены в XLSX (раунд {draw_result.round.round_number})."
+            )
+            if report_status is False:
+                winner_lines.append(
+                    "⚠️ XLSX не удалось отправить владельцу, но результаты сохранены."
                 )
             await answer_long_html(message, f"{prefix}: {html.escape(giveaway.title)}", winner_lines)
             if action == "finish":
@@ -1249,11 +1759,28 @@ def build_router(
                 header,
                 lines,
             )
+            report_status = await send_persisted_giveaway_report(
+                bot,
+                storage,
+                giveaway,
+                settings.telegram_required_chat_id,
+            )
+            if report_status is False:
+                await message.answer(
+                    "Текстовый анонс опубликован, но XLSX-отчёт отправить не удалось. "
+                    "Сохранённые результаты не изменились; повторите команду позже."
+                )
+            elif report_status is None:
+                await message.answer(
+                    "Для этого старого розыгрыша случайные числа ещё не сохранялись, "
+                    "поэтому XLSX-протокол недоступен. Текстовый результат опубликован."
+                )
             return
 
         await message.answer(
             "Команды:\n"
             "<code>/giveaway start &lt;МИНУТЫ&gt; &lt;СООБЩЕНИЯ&gt; [ПОБЕДИТЕЛИ] [ИНТЕРВАЛ_СЕК] [МИН_УЧАСТНИКОВ] [--end ДД.ММ.ГГГГ ЧЧ:ММ] [НАЗВАНИЕ | НАГРАДА]</code>\n"
+            "<code>/giveaway edit &lt;ПАРАМЕТР&gt; &lt;ЗНАЧЕНИЕ&gt;</code>\n"
             "<code>/giveaway announce_start</code>\n"
             "<code>/giveaway status</code>\n"
             "<code>/giveaway participants [НАЗВАНИЕ]</code>\n"
@@ -1269,6 +1796,7 @@ def build_router(
     @router.message(
         Command(
             "giveaway_create",
+            "giveaway_edit",
             "giveaway_announce_start",
             "giveaway_status",
             "giveaway_participants",
@@ -1283,6 +1811,7 @@ def build_router(
             return
         shortcut_map = {
             "giveaway_create": "start",
+            "giveaway_edit": "edit",
             "giveaway_announce_start": "announce_start",
             "giveaway_status": "status",
             "giveaway_participants": "participants",

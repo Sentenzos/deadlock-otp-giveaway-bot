@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -10,10 +11,16 @@ from unittest.mock import patch
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters.command import CommandObject
-from aiogram.methods import SendMessage
+from aiogram.methods import SendDocument, SendMessage
+from openpyxl import load_workbook
 
 from app.config import Settings
-from app.main import build_router, handle_stream_state_change, owner_bot_commands
+from app.main import (
+    build_router,
+    handle_stream_state_change,
+    owner_bot_commands,
+    parse_giveaway_end_at,
+)
 from app.storage import Giveaway, Storage
 from app.twitch_chat import TwitchChatState
 
@@ -47,8 +54,11 @@ class FakeMessage:
 class FakeBot:
     def __init__(self) -> None:
         self.sent: list[tuple[int, str, dict[str, object]]] = []
+        self.documents: list[tuple[int, object, dict[str, object]]] = []
         self.member_statuses: dict[int, str] = {}
         self.failed_send_ids: set[int] = set()
+        self.failed_document_ids: set[int] = set()
+        self.failed_member_ids: set[int] = set()
 
     async def get_me(self) -> SimpleNamespace:
         return SimpleNamespace(username="deadlock_otp_bot")
@@ -61,7 +71,22 @@ class FakeBot:
             )
         self.sent.append((chat_id, text, kwargs))
 
+    async def send_document(
+        self, chat_id: int, document: object, **kwargs: object
+    ) -> None:
+        if chat_id in self.failed_document_ids:
+            raise TelegramForbiddenError(
+                method=SendDocument(chat_id=chat_id, document=document),
+                message="bot was blocked by the user",
+            )
+        self.documents.append((chat_id, document, kwargs))
+
     async def get_chat_member(self, _chat_id: int, user_id: int) -> SimpleNamespace:
+        if user_id in self.failed_member_ids:
+            raise TelegramForbiddenError(
+                method=SendMessage(chat_id=user_id, text="membership check"),
+                message="membership unavailable",
+            )
         status = self.member_statuses.get(user_id, "member")
         return SimpleNamespace(status=status, is_member=status == "member")
 
@@ -197,6 +222,11 @@ class BotCommandTests(unittest.IsolatedAsyncioTestCase):
             (giveaway_id, twitch_login, seconds, messages),
         )
         await self.storage._db.commit()
+
+    def report_workbook(self, index: int = -1):
+        document = self.bot.documents[index][1]
+        data = getattr(document, "data")
+        return load_workbook(BytesIO(data), data_only=False)
 
     async def test_start_command_explains_per_giveaway_registration(self) -> None:
         message = self.message(101, full_name="Alice", username="alice_tg")
@@ -507,6 +537,176 @@ class BotCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("alice_tv", owner.last_text)
         self.assertIn("@alice_tg", owner.last_text)
 
+    async def test_owner_can_edit_every_active_giveaway_parameter(self) -> None:
+        owner = self.message(1)
+        await self.giveaway(owner, "start 10 2 1 0 1 Исходный | Старый приз")
+        original = await self.storage.active_giveaway()
+        self.assertIsNotNone(original)
+
+        edits = (
+            ("minutes 100", "min_seconds", 6000),
+            ("messages 12", "min_messages", 12),
+            ("winners 2", "winner_count", 2),
+            ("interval 45", "message_interval_seconds", 45),
+            ("participants 7", "min_participants", 7),
+            (
+                "end 31.12.2099 23:59",
+                "end_at",
+                parse_giveaway_end_at("31.12.2099", "23:59"),
+            ),
+            ("title <Первый & главный>", "title", "<Первый & главный>"),
+            ("prize Steam 2000 ₽ | регион РФ", "prize", "Steam 2000 ₽ | регион РФ"),
+        )
+        for edit_args, attribute, expected in edits:
+            with self.subTest(edit_args=edit_args):
+                await self.giveaway(owner, f"edit {edit_args}")
+                updated = await self.storage.active_giveaway()
+                self.assertIsNotNone(updated)
+                self.assertEqual(getattr(updated, attribute), expected)
+                self.assertIn("Параметр активного розыгрыша обновлён", owner.last_text)
+
+        updated = await self.storage.active_giveaway()
+        self.assertEqual(updated.id, original.id)
+        self.assertEqual(updated.started_at, original.started_at)
+        self.assertIsNotNone(
+            await self.storage.latest_giveaway_by_title("<первый & ГЛАВНЫЙ>")
+        )
+        self.assertIsNone(await self.storage.latest_giveaway_by_title("Исходный"))
+
+        await self.giveaway(owner, "status")
+        self.assertIn("&lt;Первый &amp; главный&gt;", owner.last_text)
+        self.assertIn("Условия: 100 мин, 12 сообщений", owner.last_text)
+        self.assertIn("Интервал сообщений: 45 сек", owner.last_text)
+        self.assertIn("Победителей: 2", owner.last_text)
+        self.assertIn("не менее 7", owner.last_text)
+        self.assertIn("Steam 2000 ₽ | регион РФ", owner.last_text)
+
+        await self.giveaway(owner, "announce_start")
+        announcement = self.bot.sent[-1][1]
+        self.assertIn("Время просмотра трансляции: не менее <b>100 мин</b>", announcement)
+        self.assertIn("Сообщения в Twitch-чате: не менее <b>12</b>", announcement)
+        self.assertIn("Steam 2000 ₽ | регион РФ", announcement)
+        self.assertIn("31.12.2099 в 23:59 (МСК)", announcement)
+
+    async def test_edit_can_clear_prize_and_planned_end(self) -> None:
+        owner = self.message(1)
+        await self.giveaway(
+            owner,
+            "start 10 2 1 30 1 --end 31.12.2099 23:59 Очистка | Steam key",
+        )
+
+        await self.giveaway(owner, "edit prize clear")
+        self.assertIn("не указана", owner.last_text)
+        await self.giveaway(owner, "edit end clear")
+        self.assertIn("не задано", owner.last_text)
+
+        updated = await self.storage.active_giveaway()
+        self.assertEqual(updated.prize, "")
+        self.assertIsNone(updated.end_at)
+        await self.giveaway(owner, "announce_start")
+        self.assertNotIn("🎁 <b>Награда</b>", self.bot.sent[-1][1])
+        self.assertNotIn("Плановое завершение", self.bot.sent[-1][1])
+
+    async def test_edit_rejects_invalid_values_without_partial_changes(self) -> None:
+        owner = self.message(1)
+        await self.giveaway(owner, "start 10 2 1 30 1 Неизменный | Приз")
+        original = await self.storage.active_giveaway()
+        invalid_edits = (
+            ("minutes 0", "не меньше 1 минуты"),
+            ("messages 0", "не меньше 1"),
+            ("winners 101", "от 1 до 100"),
+            ("interval -1", "не может быть отрицательным"),
+            ("participants 100001", "от 1 до 100000"),
+            ("end 01.01.2000 00:00", "должны быть в будущем"),
+            (f"title {'я' * 121}", "длиннее 120"),
+            (f"prize {'п' * 301}", "длиннее 300"),
+            ("unknown 5", "Неизвестный параметр"),
+            ("minutes много", "целым числом"),
+            (f"minutes {'9' * 100}", "слишком большое количество минут"),
+            (f"messages {'9' * 100}", "слишком большое количество сообщений"),
+            (f"interval {'9' * 100}", "слишком большой интервал"),
+        )
+
+        for edit_args, expected_error in invalid_edits:
+            with self.subTest(edit_args=edit_args):
+                await self.giveaway(owner, f"edit {edit_args}")
+                self.assertIn(expected_error, owner.last_text)
+                self.assertEqual(await self.storage.active_giveaway(), original)
+
+    async def test_edit_cancels_pending_finish_confirmation(self) -> None:
+        owner = self.message(1)
+        await self.giveaway(owner, "start 10 2 1 30 1 Новые условия")
+        await self.giveaway(owner, "finish")
+
+        await self.giveaway(owner, "edit minutes 20")
+
+        self.assertIn("Предыдущее подтверждение завершения отменено", owner.last_text)
+        await self.giveaway(owner, "finish confirm")
+        self.assertIn("Нет действующего подтверждения", owner.last_text)
+        self.assertIsNotNone(await self.storage.active_giveaway())
+
+    async def test_finish_confirmation_detects_out_of_band_rule_change(self) -> None:
+        owner = self.message(1)
+        await self.giveaway(owner, "start 10 2 1 30 1 Контроль версии")
+        await self.giveaway(owner, "finish")
+
+        await self.storage.update_active_giveaway(min_minutes=20)
+        await self.giveaway(owner, "finish confirm")
+
+        self.assertIn("изменились параметры розыгрыша", owner.last_text)
+        self.assertIsNotNone(await self.storage.active_giveaway())
+
+    async def test_edit_same_value_keeps_pending_finish_confirmation(self) -> None:
+        owner = self.message(1)
+        await self.giveaway(owner, "start 10 2 1 30 1 Без изменений")
+        await self.giveaway(owner, "finish")
+
+        await self.giveaway(owner, "edit minutes 10")
+        self.assertIn("уже имеет указанное значение", owner.last_text)
+        await self.giveaway(owner, "finish confirm")
+
+        self.assertIsNone(await self.storage.active_giveaway())
+
+    async def test_finish_uses_edited_thresholds_and_winner_count(self) -> None:
+        owner = self.message(1)
+        await self.giveaway(owner, "start 1 1 1 0 1 Новые правила")
+        giveaway = await self.storage.active_giveaway()
+        participants = (
+            (101, "Alice", "alice_tv", "777", 120, 2),
+            (102, "Bob", "bob_tv", "778", 120, 2),
+            (103, "Eve", "eve_tv", "779", 60, 1),
+        )
+        for telegram_id, name, login, twitch_id, seconds, messages in participants:
+            await self.register(
+                giveaway,
+                telegram_id,
+                name,
+                f"{name.lower()}_tg",
+                login,
+                twitch_id,
+            )
+            await self.set_activity(
+                giveaway.id, login, seconds=seconds, messages=messages
+            )
+
+        for edit_args in (
+            "minutes 2",
+            "messages 2",
+            "winners 2",
+            "participants 2",
+        ):
+            await self.giveaway(owner, f"edit {edit_args}")
+        await self.confirm_finish(owner)
+
+        finished = await self.storage.latest_finished_giveaway()
+        winners = await self.storage.recorded_winners(finished)
+        self.assertEqual(finished.eligible_count_at_finish, 2)
+        self.assertEqual(finished.winner_count, 2)
+        self.assertEqual(
+            {winner.telegram_user_id for winner in winners},
+            {101, 102},
+        )
+
     async def test_finish_always_closes_and_announce_finish_works_without_winner(self) -> None:
         owner = self.message(1)
         await self.giveaway(owner, "start 10 2 1 0 2 Без победителей")
@@ -596,6 +796,207 @@ class BotCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("bob_tv", self.bot.sent[-1][1])
         self.assertNotIn("cara_tv", self.bot.sent[-1][1])
         self.assertNotIn("dan_tv", self.bot.sent[-1][1])
+
+    async def test_finish_rolls_all_registrations_and_publishes_private_xlsx(self) -> None:
+        owner = self.message(1)
+        await self.giveaway(
+            owner,
+            "start 10 2 1 0 1 Прозрачный ролл | Пополнение Steam",
+        )
+        giveaway = await self.storage.active_giveaway()
+        people = (
+            (101, "Private Alice", "private_alice_tg", "alice_tv", "777", 600, 2),
+            (102, "Private Bob", "private_bob_tg", "bob_tv", "778", 600, 2),
+            (987654321012345, "Private Cara", "private_cara_tg", "cara_tv", "779", 599, 2),
+        )
+        for telegram_id, name, tg_username, login, twitch_id, seconds, messages in people:
+            await self.register(
+                giveaway, telegram_id, name, tg_username, login, twitch_id
+            )
+            await self.set_activity(
+                giveaway.id, login, seconds=seconds, messages=messages
+            )
+
+        await self.giveaway(owner, "finish")
+        self.assertEqual(self.bot.documents, [])
+        with patch.object(Storage, "_unique_draw_scores", return_value=[100, 900, 500]):
+            await self.giveaway(owner, "finish confirm")
+
+        finished = await self.storage.latest_finished_giveaway()
+        winners = await self.storage.recorded_winners(finished)
+        self.assertEqual([winner.twitch_login for winner in winners], ["bob_tv"])
+        self.assertEqual(len(await self.storage.draw_rounds(finished)), 1)
+        self.assertEqual(len(self.bot.documents), 1)
+        self.assertEqual(self.bot.documents[0][0], self.settings.owner_telegram_id)
+
+        workbook = self.report_workbook()
+        try:
+            self.assertEqual(workbook.sheetnames, ["Итоги", "Участники"])
+            worksheet = workbook["Участники"]
+            rows = {
+                worksheet.cell(row=row, column=2).value: {
+                    "minutes": worksheet.cell(row=row, column=3).value,
+                    "messages": worksheet.cell(row=row, column=4).value,
+                    "admitted": worksheet.cell(row=row, column=5).value,
+                    "score": worksheet.cell(row=row, column=6).value,
+                    "place": worksheet.cell(row=row, column=7).value,
+                    "result": worksheet.cell(row=row, column=8).value,
+                }
+                for row in range(5, 8)
+            }
+            self.assertEqual(set(rows), {"alice_tv", "bob_tv", "cara_tv"})
+            self.assertEqual(rows["alice_tv"]["minutes"], 10)
+            self.assertEqual(rows["bob_tv"]["messages"], 2)
+            self.assertEqual(rows["bob_tv"]["score"], 900)
+            self.assertEqual(rows["bob_tv"]["place"], 1)
+            self.assertEqual(rows["bob_tv"]["result"], "Победитель")
+            self.assertEqual(rows["alice_tv"]["result"], "Не выбран")
+            self.assertEqual(rows["cara_tv"]["admitted"], "Нет")
+            self.assertEqual(rows["cara_tv"]["result"], "Не допущен")
+            all_values = {
+                value
+                for worksheet in workbook.worksheets
+                for row in worksheet.iter_rows(values_only=True)
+                for value in row
+            }
+            self.assertNotIn("Private Alice", all_values)
+            self.assertNotIn("private_alice_tg", all_values)
+            self.assertNotIn(987654321012345, all_values)
+        finally:
+            workbook.close()
+
+        await self.giveaway(owner, "announce_finish")
+
+        self.assertEqual(len(self.bot.documents), 2)
+        self.assertEqual(
+            self.bot.documents[-1][0], self.settings.telegram_required_chat_id
+        )
+        self.assertEqual(len(await self.storage.draw_rounds(finished)), 1)
+        public_workbook = self.report_workbook()
+        try:
+            public_scores = {
+                public_workbook["Участники"].cell(row=row, column=2).value:
+                public_workbook["Участники"].cell(row=row, column=6).value
+                for row in range(5, 8)
+            }
+            self.assertEqual(
+                public_scores,
+                {login: values["score"] for login, values in rows.items()},
+            )
+        finally:
+            public_workbook.close()
+
+    async def test_membership_error_keeps_giveaway_and_progress_active(self) -> None:
+        owner = self.message(1)
+        await self.giveaway(owner, "start 1 1 1 0 1 Ошибка Telegram")
+        giveaway = await self.storage.active_giveaway()
+        await self.register(
+            giveaway, 101, "Alice", "alice_tg", "alice_tv", "777"
+        )
+        await self.set_activity(giveaway.id, "alice_tv", seconds=60, messages=1)
+        self.bot.failed_member_ids.add(101)
+
+        await self.giveaway(owner, "finish")
+        await self.giveaway(owner, "finish confirm")
+
+        active = await self.storage.active_giveaway()
+        self.assertEqual(active.id, giveaway.id)
+        participants = await self.storage.giveaway_participants(active)
+        self.assertEqual((participants[0].seconds, participants[0].messages), (60, 1))
+        self.assertEqual(await self.storage.draw_rounds(giveaway), [])
+        self.assertEqual(self.bot.documents, [])
+        self.assertIn("Розыгрыш остаётся активным", owner.last_text)
+
+    async def test_xlsx_failure_does_not_undo_finished_draw(self) -> None:
+        owner = self.message(1)
+        await self.giveaway(owner, "start 1 1 1 0 1 Ошибка XLSX")
+        giveaway = await self.storage.active_giveaway()
+        await self.register(
+            giveaway, 101, "Alice", "alice_tg", "alice_tv", "777"
+        )
+        await self.set_activity(giveaway.id, "alice_tv", seconds=60, messages=1)
+        self.bot.failed_document_ids.add(self.settings.owner_telegram_id)
+
+        await self.confirm_finish(owner)
+
+        self.assertIsNone(await self.storage.active_giveaway())
+        finished = await self.storage.latest_finished_giveaway()
+        self.assertEqual(len(await self.storage.draw_rounds(finished)), 1)
+        winners = await self.storage.recorded_winners(finished)
+        self.assertEqual([winner.telegram_user_id for winner in winners], [101])
+        self.assertEqual(self.bot.documents, [])
+        self.assertIn("XLSX не удалось", "\n".join(text for text, _ in owner.answers))
+
+    async def test_reroll_creates_a_separate_report_round(self) -> None:
+        owner = self.message(1)
+        await self.giveaway(owner, "start 1 1 1 0 1 Два раунда")
+        giveaway = await self.storage.active_giveaway()
+        for telegram_id, name, login, twitch_id in (
+            (101, "Alice", "alice_tv", "777"),
+            (102, "Bob", "bob_tv", "778"),
+        ):
+            await self.register(
+                giveaway,
+                telegram_id,
+                name,
+                f"{name.lower()}_tg",
+                login,
+                twitch_id,
+            )
+            await self.set_activity(giveaway.id, login, seconds=60, messages=1)
+
+        await self.giveaway(owner, "finish")
+        with patch.object(Storage, "_unique_draw_scores", return_value=[900, 100]):
+            await self.giveaway(owner, "finish confirm")
+        with patch.object(Storage, "_unique_draw_scores", return_value=[800, 700]):
+            await self.giveaway(owner, "reroll")
+
+        finished = await self.storage.latest_finished_giveaway()
+        self.assertEqual(len(await self.storage.draw_rounds(finished)), 2)
+        winners = await self.storage.recorded_winners(finished)
+        self.assertEqual(
+            {winner.twitch_login for winner in winners}, {"alice_tv", "bob_tv"}
+        )
+        workbook = self.report_workbook()
+        try:
+            self.assertEqual(workbook.sheetnames, ["Итоги", "Раунд 1", "Раунд 2"])
+        finally:
+            workbook.close()
+
+        await self.giveaway(owner, "announce_finish")
+        self.assertEqual(self.bot.documents[-1][0], self.settings.telegram_required_chat_id)
+        public_workbook = self.report_workbook()
+        try:
+            self.assertEqual(public_workbook.sheetnames, ["Итоги", "Раунд 1", "Раунд 2"])
+        finally:
+            public_workbook.close()
+
+    async def test_reroll_cannot_bypass_minimum_after_finish_without_winner(self) -> None:
+        owner = self.message(1)
+        await self.giveaway(owner, "start 1 1 1 0 2 Минимум не достигнут")
+        giveaway = await self.storage.active_giveaway()
+        await self.register(
+            giveaway,
+            101,
+            "Alice",
+            "alice_tg",
+            "alice_tv",
+            "701",
+        )
+        await self.set_activity(giveaway.id, "alice_tv", seconds=60, messages=1)
+
+        await self.confirm_finish(owner)
+        finished = await self.storage.latest_finished_giveaway()
+        self.assertEqual(await self.storage.recorded_winners(finished), [])
+        self.assertEqual(len(await self.storage.draw_rounds(finished)), 1)
+        document_count = len(self.bot.documents)
+
+        await self.giveaway(owner, "reroll")
+
+        self.assertIn("Подходящих участников не осталось", owner.last_text)
+        self.assertEqual(len(await self.storage.draw_rounds(finished)), 1)
+        self.assertEqual(await self.storage.recorded_winners(finished), [])
+        self.assertEqual(len(self.bot.documents), document_count)
 
     async def test_owner_can_enable_configure_and_disable_twitch_announcements(self) -> None:
         owner = self.message(1)
@@ -736,6 +1137,7 @@ class BotCommandTests(unittest.IsolatedAsyncioTestCase):
             "link",
             "status",
             "giveaway_create",
+            "giveaway_edit",
             "giveaway_announce_start",
             "giveaway_status",
             "giveaway_participants",
@@ -751,6 +1153,8 @@ class BotCommandTests(unittest.IsolatedAsyncioTestCase):
         owner = self.message(1)
         await self.shortcut(owner, "giveaway_create", "1 1 1 0 1 Алиасы")
         self.assertIsNotNone(await self.storage.active_giveaway())
+        await self.shortcut(owner, "giveaway_edit", "minutes 2")
+        self.assertEqual((await self.storage.active_giveaway()).min_seconds, 120)
         await self.shortcut(owner, "twitch_announce", "on 15")
         self.assertIn("Twitch-анонсы включены", owner.last_text)
         await self.shortcut(owner, "giveaway_announce_start")
@@ -774,10 +1178,23 @@ class BotCommandTests(unittest.IsolatedAsyncioTestCase):
 
         await self.giveaway(user, "start 1 1")
         await self.shortcut(user, "giveaway_create", "1 1")
+        await self.shortcut(user, "giveaway_edit", "minutes 999")
         await self.shortcut(user, "twitch_announce", "on 15")
 
         self.assertEqual(user.answers, [])
         self.assertIsNone(await self.storage.active_giveaway())
+
+    async def test_non_owner_cannot_edit_an_active_giveaway(self) -> None:
+        giveaway = await self.storage.start_giveaway(10, 2, title="Только владелец")
+        user = self.message(101)
+
+        await self.giveaway(user, "edit minutes 999")
+        await self.shortcut(user, "giveaway_edit", "messages 999")
+
+        self.assertEqual(user.answers, [])
+        unchanged = await self.storage.active_giveaway()
+        self.assertEqual(unchanged.id, giveaway.id)
+        self.assertEqual((unchanged.min_seconds, unchanged.min_messages), (600, 2))
 
     async def test_finish_confirmation_can_be_cancelled_and_cannot_be_skipped(self) -> None:
         owner = self.message(1)
@@ -813,6 +1230,7 @@ class BotCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_admin_commands_report_when_required_giveaway_is_missing(self) -> None:
         cases = (
+            ("edit minutes 5", "нет активного розыгрыша для изменения"),
             ("announce_start", "Нет активного розыгрыша для анонса"),
             ("status", "Сейчас нет активного розыгрыша"),
             ("participants", "Пока нет розыгрыша"),
@@ -833,6 +1251,7 @@ class BotCommandTests(unittest.IsolatedAsyncioTestCase):
 
         for action in (
             "start",
+            "edit",
             "announce_start",
             "status",
             "participants",

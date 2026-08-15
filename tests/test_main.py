@@ -6,6 +6,7 @@ from app.main import (
     giveaway_finish_announcement,
     giveaway_start_announcement,
     giveaway_datetime_text,
+    parse_edit_args,
     parse_giveaway_end_at,
     parse_start_args,
     personal_stats_text,
@@ -43,6 +44,42 @@ class MainCommandTests(unittest.TestCase):
             parse_start_args(
                 "start 60 5 1 0 1 --end 32.13.2099 25:61 Тест".split()
             )
+
+    def test_parse_edit_args_supports_every_parameter(self) -> None:
+        end_at = parse_giveaway_end_at("31.12.2099", "23:59")
+        cases = {
+            "edit minutes 100": ("min_minutes", 100),
+            "edit messages 10": ("min_messages", 10),
+            "edit winners 2": ("winner_count", 2),
+            "edit interval 600": ("message_interval_seconds", 600),
+            "edit participants 15": ("min_participants", 15),
+            "edit end 31.12.2099 23:59": ("end_at", end_at),
+            "edit title Новый большой розыгрыш": (
+                "title",
+                "Новый большой розыгрыш",
+            ),
+            "edit prize Steam 2000 ₽ | регион РФ": (
+                "prize",
+                "Steam 2000 ₽ | регион РФ",
+            ),
+        }
+
+        for raw_args, expected in cases.items():
+            with self.subTest(raw_args=raw_args):
+                self.assertEqual(parse_edit_args(raw_args), expected)
+
+    def test_parse_edit_args_supports_russian_aliases_and_clearing(self) -> None:
+        self.assertEqual(parse_edit_args("edit минуты 90"), ("min_minutes", 90))
+        self.assertEqual(parse_edit_args("edit награда очистить"), ("prize", ""))
+        self.assertEqual(parse_edit_args("edit завершение clear"), ("end_at", None))
+
+    def test_parse_edit_args_rejects_unknown_or_missing_values(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Неизвестный параметр"):
+            parse_edit_args("edit mystery 10")
+        with self.assertRaisesRegex(ValueError, "новое значение"):
+            parse_edit_args("edit minutes")
+        with self.assertRaisesRegex(ValueError, "целым числом"):
+            parse_edit_args("edit messages много")
 
     def test_public_bot_commands_do_not_include_admin_aliases(self) -> None:
         commands = {command.command for command in public_bot_commands()}
