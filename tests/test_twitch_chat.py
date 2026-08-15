@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from app.twitch_chat import (
+    TWITCH_WEBSOCKET_PING_INTERVAL_SECONDS,
+    TWITCH_WEBSOCKET_PING_TIMEOUT_SECONDS,
     TwitchChat,
     TwitchChatState,
     TwitchLiveMonitor,
@@ -18,6 +20,7 @@ class FakeStorage:
         self.messages: list[tuple[str, str | None]] = []
         self.presence_events: list[tuple[str, str | None, bool, bool]] = []
         self.claims: list[tuple[str, str, str]] = []
+        self.session_resets: list[bool] = []
 
     async def record_message(
         self,
@@ -38,16 +41,133 @@ class FakeStorage:
         self.claims.append((code, twitch_login, twitch_user_id))
         return "linked", 101, "Alice"
 
+    async def reset_chat_session(self, *, preserve_elapsed: bool) -> None:
+        self.session_resets.append(preserve_elapsed)
+
 
 class FakeWebSocket:
     def __init__(self) -> None:
         self.sent: list[str] = []
+        self.recv_started = asyncio.Event()
+        self.recv_release = asyncio.Event()
+        self.closed = False
 
     async def send(self, line: str) -> None:
         self.sent.append(line)
 
+    async def recv(self) -> str:
+        self.recv_started.set()
+        await self.recv_release.wait()
+        return ""
+
+    async def close(self) -> None:
+        self.closed = True
+        self.recv_release.set()
+
 
 class TwitchChatTests(unittest.IsolatedAsyncioTestCase):
+    async def test_quiet_chat_uses_websocket_ping_without_irc_receive_timeout(self) -> None:
+        storage = FakeStorage()
+
+        async def notify_linked(_telegram_user_id: int, _name: str) -> None:
+            return None
+
+        chat = TwitchChat(
+            channel="deadlock_otp",
+            bot_login="deadlock_otp",
+            oauth_token="token",
+            storage=storage,  # type: ignore[arg-type]
+            notify_linked=notify_linked,
+            tracking_enabled=lambda: False,
+        )
+        websocket = FakeWebSocket()
+
+        class ConnectionContext:
+            async def __aenter__(self):
+                return websocket
+
+            async def __aexit__(self, *_args: object) -> None:
+                return None
+
+        with patch(
+            "app.twitch_chat.websockets.connect",
+            return_value=ConnectionContext(),
+        ) as connect:
+            connection_task = asyncio.create_task(chat._connect_once())
+            await asyncio.wait_for(websocket.recv_started.wait(), timeout=1)
+            await asyncio.sleep(0.05)
+
+            self.assertFalse(connection_task.done())
+            connect.assert_called_once_with(
+                "wss://irc-ws.chat.twitch.tv:443",
+                ping_interval=TWITCH_WEBSOCKET_PING_INTERVAL_SECONDS,
+                ping_timeout=TWITCH_WEBSOCKET_PING_TIMEOUT_SECONDS,
+                close_timeout=5,
+            )
+            connection_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await connection_task
+
+        self.assertEqual(storage.session_resets, [True])
+
+    async def test_twitch_irc_ping_receives_matching_pong(self) -> None:
+        storage = FakeStorage()
+
+        async def notify_linked(_telegram_user_id: int, _name: str) -> None:
+            return None
+
+        chat = TwitchChat(
+            channel="deadlock_otp",
+            bot_login="deadlock_otp",
+            oauth_token="token",
+            storage=storage,  # type: ignore[arg-type]
+            notify_linked=notify_linked,
+        )
+        websocket = FakeWebSocket()
+        chat._websocket = websocket  # type: ignore[assignment]
+
+        await chat._handle_line(websocket, "PING :tmi.twitch.tv")  # type: ignore[arg-type]
+
+        self.assertEqual(websocket.sent, ["PONG :tmi.twitch.tv"])
+
+    async def test_ready_session_resets_reconnect_backoff(self) -> None:
+        storage = FakeStorage()
+
+        async def notify_linked(_telegram_user_id: int, _name: str) -> None:
+            return None
+
+        chat = TwitchChat(
+            channel="deadlock_otp",
+            bot_login="deadlock_otp",
+            oauth_token="token",
+            storage=storage,  # type: ignore[arg-type]
+            notify_linked=notify_linked,
+        )
+        attempts = 0
+
+        async def connect_once() -> None:
+            nonlocal attempts
+            attempts += 1
+            chat._session_ready = attempts == 3
+            if attempts == 4:
+                chat.stop()
+                return
+            raise ConnectionError("simulated disconnect")
+
+        delays: list[int] = []
+
+        async def record_sleep(delay: int) -> None:
+            delays.append(delay)
+
+        chat._connect_once = connect_once  # type: ignore[method-assign]
+        with (
+            patch("app.twitch_chat.asyncio.sleep", side_effect=record_sleep),
+            patch("app.twitch_chat.logger.exception"),
+        ):
+            await chat.run_forever()
+
+        self.assertEqual(delays, [2, 4, 2])
+
     async def test_live_monitor_can_refresh_immediately(self) -> None:
         async def on_live_changed(_is_live: bool) -> None:
             return None

@@ -16,6 +16,9 @@ from .storage import Storage
 
 logger = logging.getLogger(__name__)
 
+TWITCH_WEBSOCKET_PING_INTERVAL_SECONDS = 30
+TWITCH_WEBSOCKET_PING_TIMEOUT_SECONDS = 30
+
 LinkNotice = Callable[[int, str], Awaitable[None]]
 TrackingEnabled = Callable[[], bool]
 LiveChanged = Callable[[bool], Awaitable[None]]
@@ -165,6 +168,7 @@ class TwitchChat:
         self._send_lock = asyncio.Lock()
         self._websocket: websockets.ClientConnection | None = None
         self._automated_messages: deque[tuple[str, float]] = deque(maxlen=20)
+        self._session_ready = False
 
     def stop(self) -> None:
         self._stop.set()
@@ -250,13 +254,23 @@ class TwitchChat:
                 self.state.mark_disconnected(f"{type(error).__name__}: {error}")
                 logger.exception("Соединение с Twitch-чатом оборвалось")
             if not self._stop.is_set():
+                # A session that reached JOIN/ROOMSTATE was healthy. Reconnect it
+                # promptly instead of retaining an old exponential backoff from
+                # failures that happened before it became ready.
+                if self._session_ready:
+                    retry_delay = 2
                 await asyncio.sleep(retry_delay)
-                retry_delay = min(retry_delay * 2, 60)
+                if not self._session_ready:
+                    retry_delay = min(retry_delay * 2, 60)
 
     async def _connect_once(self) -> None:
+        self._session_ready = False
         logger.info("Подключаюсь к Twitch-чату #%s", self.channel)
         async with websockets.connect(
-            "wss://irc-ws.chat.twitch.tv:443", ping_interval=None, close_timeout=5
+            "wss://irc-ws.chat.twitch.tv:443",
+            ping_interval=TWITCH_WEBSOCKET_PING_INTERVAL_SECONDS,
+            ping_timeout=TWITCH_WEBSOCKET_PING_TIMEOUT_SECONDS,
+            close_timeout=5,
         ) as websocket:
             self._websocket = websocket
             try:
@@ -270,11 +284,10 @@ class TwitchChat:
                 logger.info("Запросил вход в Twitch-чат #%s", self.channel)
 
                 while not self._stop.is_set():
-                    try:
-                        payload = await asyncio.wait_for(websocket.recv(), timeout=180)
-                    except TimeoutError:
-                        # Twitch normally sends an IRC PING. An idle connection is suspect.
-                        raise TimeoutError("Twitch не прислал keepalive за 180 секунд")
+                    # A quiet IRC channel is valid. ``websockets`` independently
+                    # sends WebSocket Ping frames and closes a genuinely dead
+                    # connection when no Pong arrives within ping_timeout.
+                    payload = await websocket.recv()
                     for line in str(payload).split("\r\n"):
                         if line:
                             await self._handle_line(websocket, line)
@@ -310,6 +323,7 @@ class TwitchChat:
                 raise PermissionError(notice)
             return
         if " ROOMSTATE #" in message and self._is_our_channel(message):
+            self._session_ready = True
             self.state.mark_connected()
             logger.info("Twitch-чат #%s готов: ROOMSTATE получен", self.channel)
             return
@@ -317,6 +331,7 @@ class TwitchChat:
             login = self._login_from(message)
             if login is not None and self._is_our_channel(message):
                 if login == self.bot_login and not self.state.connected:
+                    self._session_ready = True
                     self.state.mark_connected()
                 await self.storage.mark_joined(
                     login,
@@ -332,6 +347,7 @@ class TwitchChat:
         if " 353 " in message:
             names = _NAMES_RE.search(message)
             if names is not None and names["channel"].lower() == self.channel:
+                self._session_ready = True
                 self.state.mark_connected()
                 logger.info("Twitch-чат #%s готов: получен список участников", self.channel)
                 for login in names["names"].split():
@@ -357,6 +373,7 @@ class TwitchChat:
             )
             return
         if not self.state.connected:
+            self._session_ready = True
             self.state.mark_connected()
         self.state.mark_privmsg_seen()
         text = message.split(" :", 1)[1] if " :" in message else ""
