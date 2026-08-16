@@ -57,12 +57,12 @@ def giveaway_twitch_chat_query_response(
     parts = [
         f"🎁 Розыгрыш «{giveaway.title}»",
         f"Регистрация: {registration_link}",
-        f"Условие: подписка на Telegram-канал — {channel_link}",
     ]
     if giveaway.prize:
         parts.append(f"Приз: {giveaway.prize}")
+    parts.append(f"Условия: подписка на Telegram-канал — {channel_link}")
     conditions = (
-        f"Условия: {giveaway.min_seconds // 60} мин просмотра трансляции и "
+        f"{giveaway.min_seconds // 60} мин просмотра трансляции и "
         f"{giveaway.min_messages} сообщений"
     )
     if giveaway.message_interval_seconds > 0:

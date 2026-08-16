@@ -286,14 +286,14 @@ class TwitchAnnouncementTextTests(unittest.TestCase):
         self.assertIn("🎁 Розыгрыш «Розыгрыш ключа»", text)
         self.assertIn("Приз: Steam key", text)
         self.assertIn(
-            "Условия: 100 мин просмотра трансляции и 100 сообщений "
+            "100 мин просмотра трансляции и 100 сообщений "
             "(интервал от 30 сек)",
             text,
         )
         self.assertIn("Победителей: 2", text)
         self.assertIn("Завершение: 31.12.2030 22:30 МСК", text)
         self.assertIn(
-            "Условие: подписка на Telegram-канал — https://t.me/deadlock_otp",
+            "Условия: подписка на Telegram-канал — https://t.me/deadlock_otp",
             text,
         )
         self.assertIn(
@@ -301,9 +301,10 @@ class TwitchAnnouncementTextTests(unittest.TestCase):
         )
         self.assertNotIn("99", text)
         self.assertNotIn("допущенных участников", text)
-        self.assertLess(text.index("Регистрация:"), text.index("Условие: подписка"))
-        self.assertLess(text.index("Условие: подписка"), text.index("Приз:"))
-        self.assertLess(text.index("Условия:"), text.index("Победителей:"))
+        self.assertLess(text.index("Регистрация:"), text.index("Приз:"))
+        self.assertLess(text.index("Приз:"), text.index("Условия: подписка"))
+        self.assertLess(text.index("Условия: подписка"), text.index("100 мин"))
+        self.assertLess(text.index("100 мин"), text.index("Победителей:"))
         self.assertLess(text.index("Победителей:"), text.index("Завершение:"))
         self.assertTrue(text.endswith("Завершение: 31.12.2030 22:30 МСК"))
 
@@ -340,9 +341,11 @@ class TwitchAnnouncementTextTests(unittest.TestCase):
             chunks[0],
         )
         self.assertIn(
-            "Условие: подписка на Telegram-канал — https://t.me/deadlock_otp",
+            "Условия: подписка на Telegram-канал — https://t.me/deadlock_otp",
             chunks[0],
         )
+        self.assertTrue(chunks[0].endswith("(интервал от 300 сек)"))
+        self.assertTrue(chunks[-1].startswith("Победителей: 1"))
         self.assertTrue(chunks[-1].endswith("Завершение: 21.08.2026 18:00 МСК"))
 
     def test_query_response_omits_optional_fields(self) -> None:
