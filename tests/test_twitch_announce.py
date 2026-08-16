@@ -10,7 +10,7 @@ from app.twitch_announce import (
     giveaway_twitch_chat_announcement,
     giveaway_twitch_chat_query_response,
 )
-from app.twitch_chat import TwitchChatState
+from app.twitch_chat import TwitchChatState, split_chat_message
 
 
 class TwitchGiveawayAnnouncerTests(unittest.IsolatedAsyncioTestCase):
@@ -298,6 +298,39 @@ class TwitchAnnouncementTextTests(unittest.TestCase):
         )
         self.assertNotIn("99", text)
         self.assertNotIn("допущенных участников", text)
+
+    def test_registration_link_stays_in_first_chunk_for_current_giveaway_text(self) -> None:
+        from app.storage import Giveaway
+
+        giveaway = Giveaway(
+            1,
+            "active",
+            "Первый Steam-розыгрыш",
+            "Пополнение Steam на 2000 ₽",
+            1,
+            1,
+            6000,
+            10,
+            300,
+            1,
+            None,
+            None,
+            1787338800,
+        )
+
+        chunks = split_chat_message(
+            giveaway_twitch_chat_query_response(
+                giveaway,
+                "deadlock_otp_bot",
+                "https://t.me/deadlock_otp",
+            )
+        )
+
+        self.assertGreater(len(chunks), 1)
+        self.assertIn(
+            "Регистрация: https://t.me/deadlock_otp_bot?start=link",
+            chunks[0],
+        )
 
     def test_query_response_omits_optional_fields(self) -> None:
         from app.storage import Giveaway

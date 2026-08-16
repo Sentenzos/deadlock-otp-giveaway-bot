@@ -54,7 +54,10 @@ def giveaway_twitch_chat_query_response(
         )
 
     registration_link = f"https://t.me/{bot_username.lstrip('@')}?start=link"
-    parts = [f"🎁 Розыгрыш «{giveaway.title}»"]
+    parts = [
+        f"🎁 Розыгрыш «{giveaway.title}»",
+        f"Регистрация: {registration_link}",
+    ]
     if giveaway.prize:
         parts.append(f"Приз: {giveaway.prize}")
     conditions = (
@@ -72,7 +75,6 @@ def giveaway_twitch_chat_query_response(
     parts.extend(
         [
             f"Telegram: {channel_link}",
-            f"Регистрация: {registration_link}",
         ]
     )
     return " | ".join(parts)
