@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -99,6 +100,7 @@ class BotCommandTests(unittest.IsolatedAsyncioTestCase):
         self.settings = Settings(
             telegram_bot_token="999999:token",
             telegram_required_chat_id=-100222,
+            telegram_channel_url="https://t.me/deadlock_otp",
             owner_telegram_id=1,
             twitch_channel="deadlock_otp",
             twitch_bot_login="deadlock_otp",
@@ -106,6 +108,7 @@ class BotCommandTests(unittest.IsolatedAsyncioTestCase):
             twitch_excluded_logins=(),
             telegram_excluded_usernames=(),
             twitch_live_check_interval_seconds=10,
+            giveaway_xlsx_enabled=True,
             database_path=self.storage.path,
         )
         self.bot = FakeBot()
@@ -885,6 +888,56 @@ class BotCommandTests(unittest.IsolatedAsyncioTestCase):
             )
         finally:
             public_workbook.close()
+
+    async def test_disabled_xlsx_keeps_draw_data_but_sends_no_documents(self) -> None:
+        disabled_settings = replace(self.settings, giveaway_xlsx_enabled=False)
+        router = build_router(
+            disabled_settings,
+            self.storage,
+            self.bot,  # type: ignore[arg-type]
+            self.twitch_state,
+        )
+        handlers = {
+            handler.callback.__name__: handler.callback for handler in router.message.handlers
+        }
+        owner = self.message(1)
+
+        async def giveaway_command(args: str) -> None:
+            await handlers["giveaway_command"](
+                owner, CommandObject(command="giveaway", args=args)
+            )
+
+        await giveaway_command("start 1 1 1 0 1 Без таблицы")
+        giveaway = await self.storage.active_giveaway()
+        await self.register(
+            giveaway, 101, "Alice", "alice_tg", "alice_tv", "777"
+        )
+        await self.set_activity(giveaway.id, "alice_tv", seconds=60, messages=1)
+
+        await giveaway_command("finish")
+        await giveaway_command("finish confirm")
+
+        finished = await self.storage.latest_finished_giveaway()
+        self.assertEqual(len(await self.storage.draw_rounds(finished)), 1)
+        self.assertEqual(
+            [winner.twitch_login for winner in await self.storage.recorded_winners(finished)],
+            ["alice_tv"],
+        )
+        self.assertEqual(self.bot.documents, [])
+        private_text = "\n".join(text for text, _kwargs in owner.answers)
+        self.assertIn("сохранены в базе данных", private_text)
+        self.assertNotIn("XLSX", private_text)
+
+        await giveaway_command("announce_finish")
+
+        self.assertEqual(self.bot.documents, [])
+        channel_messages = [
+            text
+            for chat_id, text, _kwargs in self.bot.sent
+            if chat_id == self.settings.telegram_required_chat_id
+        ]
+        self.assertTrue(channel_messages)
+        self.assertIn("alice_tv", "\n".join(channel_messages))
 
     async def test_membership_error_keeps_giveaway_and_progress_active(self) -> None:
         owner = self.message(1)

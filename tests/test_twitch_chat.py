@@ -10,8 +10,10 @@ from app.twitch_chat import (
     TwitchChat,
     TwitchChatState,
     TwitchLiveMonitor,
+    is_giveaway_query,
     parse_link_code,
     sanitize_chat_message,
+    split_chat_message,
 )
 
 
@@ -515,6 +517,110 @@ class TwitchChatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(storage.claims, [("ABCD1234", "viewer_tv", "778")])
         self.assertEqual(linked, [(101, "Alice")])
 
+    async def test_giveaway_query_replies_offline_without_counting_comment(self) -> None:
+        storage = FakeStorage()
+
+        async def notify_linked(_telegram_user_id: int, _name: str) -> None:
+            return None
+
+        responses = 0
+
+        async def giveaway_response() -> str:
+            nonlocal responses
+            responses += 1
+            return "Условия розыгрыша | Telegram: https://t.me/deadlock_otp"
+
+        state = TwitchChatState()
+        state.mark_connected()
+        chat = TwitchChat(
+            channel="deadlock_otp",
+            bot_login="deadlock_otp",
+            oauth_token="token",
+            storage=storage,  # type: ignore[arg-type]
+            notify_linked=notify_linked,
+            state=state,
+            tracking_enabled=lambda: False,
+            giveaway_query_response=giveaway_response,
+        )
+        websocket = FakeWebSocket()
+        chat._websocket = websocket  # type: ignore[assignment]
+
+        await chat._handle_privmsg(
+            {"user-id": "778"},
+            ":viewer_tv!viewer_tv@viewer_tv.tmi.twitch.tv "
+            "PRIVMSG #deadlock_otp :!розыгрыш",
+        )
+
+        self.assertEqual(responses, 1)
+        self.assertEqual(
+            websocket.sent,
+            [
+                "PRIVMSG #deadlock_otp :"
+                "Условия розыгрыша | Telegram: https://t.me/deadlock_otp"
+            ],
+        )
+        self.assertEqual(storage.messages, [])
+        self.assertEqual(
+            storage.presence_events,
+            [("viewer_tv", "778", False, False)],
+        )
+
+    async def test_giveaway_query_has_global_thirty_second_cooldown(self) -> None:
+        storage = FakeStorage()
+
+        async def notify_linked(_telegram_user_id: int, _name: str) -> None:
+            return None
+
+        responses = 0
+
+        async def giveaway_response() -> str:
+            nonlocal responses
+            responses += 1
+            return "Розыгрыш"
+
+        state = TwitchChatState()
+        state.mark_connected()
+        chat = TwitchChat(
+            channel="deadlock_otp",
+            bot_login="deadlock_otp",
+            oauth_token="token",
+            storage=storage,  # type: ignore[arg-type]
+            notify_linked=notify_linked,
+            state=state,
+            tracking_enabled=lambda: True,
+            giveaway_query_response=giveaway_response,
+        )
+        websocket = FakeWebSocket()
+        chat._websocket = websocket  # type: ignore[assignment]
+
+        for login, user_id in (("alice_tv", "701"), ("bob_tv", "702")):
+            await chat._handle_privmsg(
+                {"user-id": user_id},
+                f":{login}!{login}@{login}.tmi.twitch.tv "
+                "PRIVMSG #deadlock_otp :!розыгрыш",
+            )
+
+        self.assertEqual(responses, 1)
+        self.assertEqual(len(websocket.sent), 1)
+        self.assertEqual(storage.messages, [])
+        self.assertEqual(
+            storage.presence_events,
+            [
+                ("alice_tv", "701", False, True),
+                ("bob_tv", "702", False, True),
+            ],
+        )
+
+        assert chat._last_giveaway_query_response_at is not None
+        chat._last_giveaway_query_response_at -= 30
+        await chat._handle_privmsg(
+            {"user-id": "702"},
+            ":bob_tv!bob_tv@bob_tv.tmi.twitch.tv "
+            "PRIVMSG #deadlock_otp :!розыгрыш",
+        )
+        self.assertEqual(responses, 2)
+        self.assertEqual(len(websocket.sent), 2)
+
     async def test_slow_telegram_notice_does_not_block_twitch_chat_reader(self) -> None:
         storage = FakeStorage()
         release_notice = asyncio.Event()
@@ -600,6 +706,35 @@ class LinkCodeParserTests(unittest.TestCase):
         self.assertEqual(
             parse_link_code("\x01ACTION !link ABCD1234\x01"),
             "ABCD1234",
+        )
+
+    def test_giveaway_query_accepts_case_and_harmless_formatting(self) -> None:
+        self.assertTrue(is_giveaway_query("  !РоЗыГрЫш  "))
+        self.assertTrue(is_giveaway_query("！розыгрыш\u200b"))
+        self.assertTrue(is_giveaway_query("\x01ACTION !розыгрыш\x01"))
+        self.assertFalse(is_giveaway_query("!розыгрыш сейчас"))
+
+    def test_long_giveaway_reply_is_split_without_losing_links(self) -> None:
+        text = (
+            "🎁 Розыгрыш «" + "Очень длинное название " * 10 + "» | "
+            "Приз: Пополнение Steam | Условия: 100 мин просмотра трансляции и "
+            "100 сообщений (интервал от 30 сек) | Победителей: 1 | "
+            "Telegram: https://t.me/deadlock_otp | "
+            "Регистрация: https://t.me/deadlock_otp_bot?start=link"
+        )
+
+        chunks = split_chat_message(text)
+
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(chunk.encode("utf-8")) <= 400 for chunk in chunks))
+        self.assertTrue(
+            any("Telegram: https://t.me/deadlock_otp" in chunk for chunk in chunks)
+        )
+        self.assertTrue(
+            any(
+                "Регистрация: https://t.me/deadlock_otp_bot?start=link" in chunk
+                for chunk in chunks
+            )
         )
 
 

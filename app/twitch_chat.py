@@ -22,30 +22,69 @@ TWITCH_WEBSOCKET_PING_TIMEOUT_SECONDS = 30
 LinkNotice = Callable[[int, str], Awaitable[None]]
 TrackingEnabled = Callable[[], bool]
 LiveChanged = Callable[[bool], Awaitable[None]]
+GiveawayQueryResponse = Callable[[], Awaitable[str]]
 
 _PREFIX_RE = re.compile(r"^:(?P<login>[^! ]+)![^ ]+ ")
 _NAMES_RE = re.compile(r" 353 [^ ]+ = #(?P<channel>[^ ]+) :(?P<names>.*)$")
 _LINK_RE = re.compile(r"^!link\s+([A-Z0-9]{8})\s*$", re.IGNORECASE)
+_GIVEAWAY_QUERY_RE = re.compile(r"^!розыгрыш\s*$", re.IGNORECASE)
 _MAX_CHAT_MESSAGE_BYTES = 400
+GIVEAWAY_QUERY_COOLDOWN_SECONDS = 30
 
 
 def parse_link_code(text: str) -> str | None:
-    cleaned = unicodedata.normalize("NFKC", text)
-    cleaned = cleaned.replace("\u200b", "").replace("\ufeff", "").strip()
-    if cleaned.startswith("\x01ACTION ") and cleaned.endswith("\x01"):
-        cleaned = cleaned[len("\x01ACTION ") : -1].strip()
+    cleaned = _clean_chat_command(text)
     match = _LINK_RE.fullmatch(cleaned)
     return match.group(1).upper() if match is not None else None
 
 
+def is_giveaway_query(text: str) -> bool:
+    return _GIVEAWAY_QUERY_RE.fullmatch(_clean_chat_command(text)) is not None
+
+
+def _clean_chat_command(text: str) -> str:
+    cleaned = unicodedata.normalize("NFKC", text)
+    cleaned = cleaned.replace("\u200b", "").replace("\ufeff", "").strip()
+    if cleaned.startswith("\x01ACTION ") and cleaned.endswith("\x01"):
+        cleaned = cleaned[len("\x01ACTION ") : -1].strip()
+    return cleaned
+
+
 def sanitize_chat_message(text: str) -> str:
-    cleaned = " ".join(
-        text.replace("\r", " ").replace("\n", " ").replace("\x00", " ").split()
-    )
+    cleaned = _normalize_chat_message(text)
     encoded = cleaned.encode("utf-8")
     if len(encoded) <= _MAX_CHAT_MESSAGE_BYTES:
         return cleaned
     return encoded[:_MAX_CHAT_MESSAGE_BYTES].decode("utf-8", errors="ignore").rstrip()
+
+
+def split_chat_message(text: str) -> list[str]:
+    """Split a logical reply at field separators without losing trailing links."""
+    cleaned = _normalize_chat_message(text)
+    if not cleaned:
+        return []
+    if len(cleaned.encode("utf-8")) <= _MAX_CHAT_MESSAGE_BYTES:
+        return [cleaned]
+
+    chunks: list[str] = []
+    current = ""
+    for field in cleaned.split(" | "):
+        candidate = f"{current} | {field}" if current else field
+        if len(candidate.encode("utf-8")) <= _MAX_CHAT_MESSAGE_BYTES:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+        current = sanitize_chat_message(field)
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _normalize_chat_message(text: str) -> str:
+    return " ".join(
+        text.replace("\r", " ").replace("\n", " ").replace("\x00", " ").split()
+    )
 
 
 @dataclass(slots=True)
@@ -152,6 +191,8 @@ class TwitchChat:
         state: TwitchChatState | None = None,
         tracking_enabled: TrackingEnabled | None = None,
         excluded_logins: tuple[str, ...] = (),
+        giveaway_query_response: GiveawayQueryResponse | None = None,
+        giveaway_query_cooldown_seconds: int = GIVEAWAY_QUERY_COOLDOWN_SECONDS,
     ) -> None:
         self.channel = channel.lower()
         self.bot_login = bot_login.lower()
@@ -163,12 +204,15 @@ class TwitchChat:
         self.excluded_logins = {
             login.strip().lower().lstrip("@") for login in excluded_logins if login.strip()
         }
+        self.giveaway_query_response = giveaway_query_response
+        self.giveaway_query_cooldown_seconds = giveaway_query_cooldown_seconds
         self._stop = asyncio.Event()
         self._notice_tasks: set[asyncio.Task[None]] = set()
         self._send_lock = asyncio.Lock()
         self._websocket: websockets.ClientConnection | None = None
         self._automated_messages: deque[tuple[str, float]] = deque(maxlen=20)
         self._session_ready = False
+        self._last_giveaway_query_response_at: float | None = None
 
     def stop(self) -> None:
         self._stop.set()
@@ -188,7 +232,7 @@ class TwitchChat:
                 raise ConnectionError("Twitch IRC-соединение уже сменилось")
             await websocket.send(line)
 
-    async def send_chat_message(self, text: str) -> bool:
+    async def send_chat_message(self, text: str, *, allow_offline: bool = False) -> bool:
         cleaned = sanitize_chat_message(text)
         websocket = self._websocket
         if not cleaned or websocket is None or not self.state.connected:
@@ -198,7 +242,7 @@ class TwitchChat:
                 if (
                     self._websocket is not websocket
                     or not self.state.connected
-                    or not self.tracking_enabled()
+                    or (not allow_offline and not self.tracking_enabled())
                 ):
                     return False
                 await websocket.send(f"PRIVMSG #{self.channel} :{cleaned}")
@@ -412,6 +456,15 @@ class TwitchChat:
             else:
                 logger.warning("Не удалось привязать Twitch %s: %s", login, status)
             return
+        if is_giveaway_query(text):
+            await self.storage.record_message(
+                login,
+                twitch_user_id,
+                count_message=False,
+                count_time=count_time,
+            )
+            await self._answer_giveaway_query()
+            return
         if not count_time:
             await self.storage.record_message(
                 login,
@@ -425,6 +478,34 @@ class TwitchChat:
                 logger.debug("Не учитываю сообщение %s: стрим сейчас не live", login)
             return
         await self.storage.record_message(login, twitch_user_id)
+
+    async def _answer_giveaway_query(self) -> None:
+        if self.giveaway_query_response is None:
+            return
+        now = time.monotonic()
+        last_response_at = self._last_giveaway_query_response_at
+        if (
+            last_response_at is not None
+            and now - last_response_at < self.giveaway_query_cooldown_seconds
+        ):
+            return
+        self._last_giveaway_query_response_at = now
+        try:
+            response = await self.giveaway_query_response()
+            chunks = split_chat_message(response)
+        except Exception:
+            self._last_giveaway_query_response_at = last_response_at
+            logger.exception("Не удалось подготовить ответ на !розыгрыш")
+            return
+        sent_any = False
+        for chunk in chunks:
+            if not await self.send_chat_message(chunk, allow_offline=True):
+                if not sent_any:
+                    self._last_giveaway_query_response_at = last_response_at
+                return
+            sent_any = True
+        if not sent_any:
+            self._last_giveaway_query_response_at = last_response_at
 
     def _is_our_channel(self, line: str) -> bool:
         line = line.lower()

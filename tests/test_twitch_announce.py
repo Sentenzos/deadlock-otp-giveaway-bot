@@ -8,6 +8,7 @@ from app.storage import Storage
 from app.twitch_announce import (
     TwitchGiveawayAnnouncer,
     giveaway_twitch_chat_announcement,
+    giveaway_twitch_chat_query_response,
 )
 from app.twitch_chat import TwitchChatState
 
@@ -256,6 +257,73 @@ class TwitchAnnouncementTextTests(unittest.TestCase):
         self.assertIn("Steam key", text)
         self.assertIn("10 мин", text)
         self.assertIn("2 сообщений", text)
+
+    def test_query_response_contains_approved_fields_and_both_links(self) -> None:
+        from app.storage import Giveaway
+
+        giveaway = Giveaway(
+            1,
+            "active",
+            "Розыгрыш ключа",
+            "Steam key",
+            2,
+            99,
+            6000,
+            100,
+            30,
+            1,
+            None,
+            None,
+            1924975800,
+        )
+
+        text = giveaway_twitch_chat_query_response(
+            giveaway,
+            "deadlock_otp_bot",
+            "https://t.me/deadlock_otp/",
+        )
+
+        self.assertIn("🎁 Розыгрыш «Розыгрыш ключа»", text)
+        self.assertIn("Приз: Steam key", text)
+        self.assertIn(
+            "Условия: 100 мин просмотра трансляции и 100 сообщений "
+            "(интервал от 30 сек)",
+            text,
+        )
+        self.assertIn("Победителей: 2", text)
+        self.assertIn("Завершение: 31.12.2030 22:30 МСК", text)
+        self.assertIn("Telegram: https://t.me/deadlock_otp", text)
+        self.assertIn(
+            "Регистрация: https://t.me/deadlock_otp_bot?start=link", text
+        )
+        self.assertNotIn("99", text)
+        self.assertNotIn("допущенных участников", text)
+
+    def test_query_response_omits_optional_fields(self) -> None:
+        from app.storage import Giveaway
+
+        giveaway = Giveaway(
+            1, "active", "Без даты", "", 1, 1, 600, 2, 0, 1, None, None
+        )
+
+        text = giveaway_twitch_chat_query_response(
+            giveaway, "deadlock_otp_bot", "https://t.me/deadlock_otp"
+        )
+
+        self.assertNotIn("Приз:", text)
+        self.assertNotIn("интервал", text)
+        self.assertNotIn("Завершение:", text)
+
+    def test_query_response_without_active_giveaway_points_to_channel(self) -> None:
+        text = giveaway_twitch_chat_query_response(
+            None, "deadlock_otp_bot", "https://t.me/deadlock_otp"
+        )
+
+        self.assertEqual(
+            text,
+            "Сейчас активного розыгрыша нет. Следите за анонсами: "
+            "https://t.me/deadlock_otp",
+        )
 
 
 if __name__ == "__main__":

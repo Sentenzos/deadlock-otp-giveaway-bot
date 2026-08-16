@@ -36,7 +36,10 @@ from .storage import (
     Giveaway,
     Storage,
 )
-from .twitch_announce import TwitchGiveawayAnnouncer
+from .twitch_announce import (
+    TwitchGiveawayAnnouncer,
+    giveaway_twitch_chat_query_response,
+)
 from .twitch_chat import TwitchChat, TwitchChatState, TwitchLiveMonitor
 
 logger = logging.getLogger(__name__)
@@ -1652,12 +1655,14 @@ def build_router(
                     return
 
             winners = [draw_entry_candidate(entry) for entry in draw_result.winners]
-            report_status = await send_persisted_giveaway_report(
-                bot,
-                storage,
-                giveaway,
-                settings.owner_telegram_id,
-            )
+            report_status: bool | None = None
+            if settings.giveaway_xlsx_enabled:
+                report_status = await send_persisted_giveaway_report(
+                    bot,
+                    storage,
+                    giveaway,
+                    settings.owner_telegram_id,
+                )
             report_warning = (
                 "\n\n⚠️ XLSX-отчёт не удалось отправить владельцу. "
                 "Результаты жеребьёвки сохранены; файл можно повторно получить через "
@@ -1677,12 +1682,21 @@ def build_router(
                         "а для выбора требовалось не менее "
                         f"<b>{draw_result.round.min_participants_required}</b>"
                     )
+                if settings.giveaway_xlsx_enabled:
+                    saved_result_text = (
+                        "Случайные числа и итоговая статистика всех зарегистрированных "
+                        "сохранены в XLSX. Чтобы опубликовать завершение и таблицу в "
+                        "канал/чат, используйте <code>/giveaway announce_finish</code>."
+                    )
+                else:
+                    saved_result_text = (
+                        "Случайные числа и итоговая статистика всех зарегистрированных "
+                        "сохранены в базе данных. Чтобы опубликовать завершение в "
+                        "канал/чат, используйте <code>/giveaway announce_finish</code>."
+                    )
                 await message.answer(
                     f"Розыгрыш завершён без победителей: {reason}.\n\n"
-                    "Случайные числа и итоговая статистика всех зарегистрированных "
-                    "сохранены в XLSX. Чтобы опубликовать завершение и таблицу в "
-                    "канал/чат, используйте <code>/giveaway announce_finish</code>."
-                    f"{report_warning}",
+                    f"{saved_result_text}{report_warning}",
                     parse_mode=ParseMode.HTML,
                 )
                 return
@@ -1721,10 +1735,16 @@ def build_router(
                     f"{draw_result.round.requested_winner_count}, "
                     f"подходящих кандидатов нашлось: {len(winners)}."
                 )
-            winner_lines.append(
-                "📊 Случайные числа и статистика всех зарегистрированных "
-                f"сохранены в XLSX (раунд {draw_result.round.round_number})."
-            )
+            if settings.giveaway_xlsx_enabled:
+                winner_lines.append(
+                    "📊 Случайные числа и статистика всех зарегистрированных "
+                    f"сохранены в XLSX (раунд {draw_result.round.round_number})."
+                )
+            else:
+                winner_lines.append(
+                    "📊 Случайные числа и статистика всех зарегистрированных "
+                    f"сохранены в базе данных (раунд {draw_result.round.round_number})."
+                )
             if report_status is False:
                 winner_lines.append(
                     "⚠️ XLSX не удалось отправить владельцу, но результаты сохранены."
@@ -1759,22 +1779,23 @@ def build_router(
                 header,
                 lines,
             )
-            report_status = await send_persisted_giveaway_report(
-                bot,
-                storage,
-                giveaway,
-                settings.telegram_required_chat_id,
-            )
-            if report_status is False:
-                await message.answer(
-                    "Текстовый анонс опубликован, но XLSX-отчёт отправить не удалось. "
-                    "Сохранённые результаты не изменились; повторите команду позже."
+            if settings.giveaway_xlsx_enabled:
+                report_status = await send_persisted_giveaway_report(
+                    bot,
+                    storage,
+                    giveaway,
+                    settings.telegram_required_chat_id,
                 )
-            elif report_status is None:
-                await message.answer(
-                    "Для этого старого розыгрыша случайные числа ещё не сохранялись, "
-                    "поэтому XLSX-протокол недоступен. Текстовый результат опубликован."
-                )
+                if report_status is False:
+                    await message.answer(
+                        "Текстовый анонс опубликован, но XLSX-отчёт отправить не удалось. "
+                        "Сохранённые результаты не изменились; повторите команду позже."
+                    )
+                elif report_status is None:
+                    await message.answer(
+                        "Для этого старого розыгрыша случайные числа ещё не сохранялись, "
+                        "поэтому XLSX-протокол недоступен. Текстовый результат опубликован."
+                    )
             return
 
         await message.answer(
@@ -1859,6 +1880,17 @@ async def run() -> None:
         if is_live and twitch_announcer is not None:
             twitch_announcer.wake()
 
+    bot_info = await bot.get_me()
+    if not bot_info.username:
+        raise RuntimeError("У Telegram-бота не задан username")
+
+    async def giveaway_query_response() -> str:
+        return giveaway_twitch_chat_query_response(
+            await storage.active_giveaway(),
+            bot_info.username,
+            settings.telegram_channel_url,
+        )
+
     twitch = TwitchChat(
         channel=settings.twitch_channel,
         bot_login=settings.twitch_bot_login,
@@ -1868,6 +1900,7 @@ async def run() -> None:
         state=twitch_state,
         tracking_enabled=lambda: twitch_state.stream_live,
         excluded_logins=settings.twitch_excluded_logins,
+        giveaway_query_response=giveaway_query_response,
     )
     live_monitor = TwitchLiveMonitor(
         channel=settings.twitch_channel,
@@ -1876,9 +1909,6 @@ async def run() -> None:
         on_live_changed=on_live_changed,
         poll_interval_seconds=settings.twitch_live_check_interval_seconds,
     )
-    bot_info = await bot.get_me()
-    if not bot_info.username:
-        raise RuntimeError("У Telegram-бота не задан username")
     twitch_announcer = TwitchGiveawayAnnouncer(
         storage=storage,
         twitch_state=twitch_state,

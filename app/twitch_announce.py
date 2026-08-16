@@ -40,6 +40,44 @@ def giveaway_twitch_chat_announcement(
     return " | ".join(parts)
 
 
+def giveaway_twitch_chat_query_response(
+    giveaway: Giveaway | None,
+    bot_username: str,
+    telegram_channel_url: str,
+) -> str:
+    """Build the approved public response to ``!розыгрыш``."""
+    channel_link = telegram_channel_url.rstrip("/")
+    if giveaway is None:
+        return (
+            "Сейчас активного розыгрыша нет. Следите за анонсами: "
+            f"{channel_link}"
+        )
+
+    registration_link = f"https://t.me/{bot_username.lstrip('@')}?start=link"
+    parts = [f"🎁 Розыгрыш «{giveaway.title}»"]
+    if giveaway.prize:
+        parts.append(f"Приз: {giveaway.prize}")
+    conditions = (
+        f"Условия: {giveaway.min_seconds // 60} мин просмотра трансляции и "
+        f"{giveaway.min_messages} сообщений"
+    )
+    if giveaway.message_interval_seconds > 0:
+        conditions += f" (интервал от {giveaway.message_interval_seconds} сек)"
+    parts.extend([conditions, f"Победителей: {giveaway.winner_count}"])
+    if giveaway.end_at is not None:
+        end_text = datetime.fromtimestamp(giveaway.end_at, MOSCOW_TIMEZONE).strftime(
+            "%d.%m.%Y %H:%M МСК"
+        )
+        parts.append(f"Завершение: {end_text}")
+    parts.extend(
+        [
+            f"Telegram: {channel_link}",
+            f"Регистрация: {registration_link}",
+        ]
+    )
+    return " | ".join(parts)
+
+
 class TwitchGiveawayAnnouncer:
     def __init__(
         self,
