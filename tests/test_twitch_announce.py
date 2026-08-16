@@ -292,12 +292,20 @@ class TwitchAnnouncementTextTests(unittest.TestCase):
         )
         self.assertIn("Победителей: 2", text)
         self.assertIn("Завершение: 31.12.2030 22:30 МСК", text)
-        self.assertIn("Telegram: https://t.me/deadlock_otp", text)
+        self.assertIn(
+            "Условие: подписка на Telegram-канал — https://t.me/deadlock_otp",
+            text,
+        )
         self.assertIn(
             "Регистрация: https://t.me/deadlock_otp_bot?start=link", text
         )
         self.assertNotIn("99", text)
         self.assertNotIn("допущенных участников", text)
+        self.assertLess(text.index("Регистрация:"), text.index("Условие: подписка"))
+        self.assertLess(text.index("Условие: подписка"), text.index("Приз:"))
+        self.assertLess(text.index("Условия:"), text.index("Победителей:"))
+        self.assertLess(text.index("Победителей:"), text.index("Завершение:"))
+        self.assertTrue(text.endswith("Завершение: 31.12.2030 22:30 МСК"))
 
     def test_registration_link_stays_in_first_chunk_for_current_giveaway_text(self) -> None:
         from app.storage import Giveaway
@@ -315,7 +323,7 @@ class TwitchAnnouncementTextTests(unittest.TestCase):
             1,
             None,
             None,
-            1787338800,
+            1787324400,
         )
 
         chunks = split_chat_message(
@@ -331,6 +339,11 @@ class TwitchAnnouncementTextTests(unittest.TestCase):
             "Регистрация: https://t.me/deadlock_otp_bot?start=link",
             chunks[0],
         )
+        self.assertIn(
+            "Условие: подписка на Telegram-канал — https://t.me/deadlock_otp",
+            chunks[0],
+        )
+        self.assertTrue(chunks[-1].endswith("Завершение: 21.08.2026 18:00 МСК"))
 
     def test_query_response_omits_optional_fields(self) -> None:
         from app.storage import Giveaway

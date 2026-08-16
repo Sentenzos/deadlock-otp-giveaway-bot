@@ -57,6 +57,7 @@ def giveaway_twitch_chat_query_response(
     parts = [
         f"🎁 Розыгрыш «{giveaway.title}»",
         f"Регистрация: {registration_link}",
+        f"Условие: подписка на Telegram-канал — {channel_link}",
     ]
     if giveaway.prize:
         parts.append(f"Приз: {giveaway.prize}")
@@ -72,11 +73,6 @@ def giveaway_twitch_chat_query_response(
             "%d.%m.%Y %H:%M МСК"
         )
         parts.append(f"Завершение: {end_text}")
-    parts.extend(
-        [
-            f"Telegram: {channel_link}",
-        ]
-    )
     return " | ".join(parts)
 
 
