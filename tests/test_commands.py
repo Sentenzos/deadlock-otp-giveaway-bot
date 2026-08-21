@@ -938,6 +938,16 @@ class BotCommandTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertTrue(channel_messages)
         self.assertIn("alice_tv", "\n".join(channel_messages))
+        sent_count = len(self.bot.sent)
+
+        await giveaway_command("report")
+
+        self.assertEqual(len(self.bot.documents), 1)
+        self.assertEqual(self.bot.documents[0][0], disabled_settings.owner_telegram_id)
+        self.assertEqual(len(self.bot.sent), sent_count)
+        self.assertIn("XLSX-отчёт отправлен", owner.last_text)
+        workbook = self.report_workbook()
+        self.assertEqual(workbook.sheetnames, ["Итоги", "Участники"])
 
     async def test_membership_error_keeps_giveaway_and_progress_active(self) -> None:
         owner = self.message(1)
@@ -1196,6 +1206,7 @@ class BotCommandTests(unittest.IsolatedAsyncioTestCase):
             "giveaway_participants",
             "giveaway_finish",
             "giveaway_announce_finish",
+            "giveaway_report",
             "giveaway_reroll",
             "giveaway",
             "viewers",
@@ -1223,6 +1234,9 @@ class BotCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.storage.active_giveaway())
         await self.shortcut(owner, "giveaway_announce_finish")
         self.assertIn("Розыгрыш завершён", self.bot.sent[-1][1])
+        await self.shortcut(owner, "giveaway_report")
+        self.assertEqual(self.bot.documents[-1][0], self.settings.owner_telegram_id)
+        self.assertIn("XLSX-отчёт отправлен", owner.last_text)
         await self.shortcut(owner, "giveaway_reroll")
         self.assertIn("Подходящих участников не осталось", owner.last_text)
 
@@ -1232,6 +1246,7 @@ class BotCommandTests(unittest.IsolatedAsyncioTestCase):
         await self.giveaway(user, "start 1 1")
         await self.shortcut(user, "giveaway_create", "1 1")
         await self.shortcut(user, "giveaway_edit", "minutes 999")
+        await self.shortcut(user, "giveaway_report")
         await self.shortcut(user, "twitch_announce", "on 15")
 
         self.assertEqual(user.answers, [])
@@ -1289,6 +1304,7 @@ class BotCommandTests(unittest.IsolatedAsyncioTestCase):
             ("participants", "Пока нет розыгрыша"),
             ("finish", "Нет активного розыгрыша для завершения"),
             ("announce_finish", "Нет завершённого розыгрыша для анонса"),
+            ("report", "Нет завершённого розыгрыша для XLSX-отчёта"),
             ("reroll", "Нет завершённого розыгрыша для перевыбора"),
         )
         for args, expected in cases:
@@ -1310,6 +1326,7 @@ class BotCommandTests(unittest.IsolatedAsyncioTestCase):
             "participants",
             "finish",
             "announce_finish",
+            "report",
             "reroll",
         ):
             self.assertIn(action, owner.last_text)

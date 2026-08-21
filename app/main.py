@@ -1010,6 +1010,7 @@ def owner_bot_commands() -> list[BotCommand]:
         BotCommand(command="giveaway_participants", description="Участники розыгрыша"),
         BotCommand(command="giveaway_finish", description="Завершить с подтверждением"),
         BotCommand(command="giveaway_announce_finish", description="Анонсировать завершение"),
+        BotCommand(command="giveaway_report", description="XLSX-отчёт себе"),
         BotCommand(command="giveaway_reroll", description="Выбрать ещё одного победителя"),
         BotCommand(command="giveaway", description="Полная команда управления"),
     ]
@@ -1798,6 +1799,39 @@ def build_router(
                     )
             return
 
+        if action in {"report", "xlsx", "protocol"}:
+            split_args = raw_args.split(maxsplit=1)
+            title_query = split_args[1].strip() if len(split_args) > 1 else ""
+            if title_query:
+                giveaway = await storage.latest_finished_giveaway_by_title(title_query)
+            else:
+                giveaway = await storage.latest_finished_giveaway()
+            if giveaway is None:
+                await message.answer("Нет завершённого розыгрыша для XLSX-отчёта.")
+                return
+            report_status = await send_persisted_giveaway_report(
+                bot,
+                storage,
+                giveaway,
+                settings.owner_telegram_id,
+            )
+            if report_status is True:
+                await message.answer(
+                    "XLSX-отчёт отправлен вам в личные сообщения. "
+                    "Анонс в канал/чат не публиковался."
+                )
+            elif report_status is None:
+                await message.answer(
+                    "Для этого старого розыгрыша случайные числа ещё не сохранялись, "
+                    "поэтому XLSX-протокол недоступен."
+                )
+            else:
+                await message.answer(
+                    "Не удалось сформировать или отправить XLSX-отчёт. "
+                    "Сохранённые результаты не изменились; повторите команду позже."
+                )
+            return
+
         await message.answer(
             "Команды:\n"
             "<code>/giveaway start &lt;МИНУТЫ&gt; &lt;СООБЩЕНИЯ&gt; [ПОБЕДИТЕЛИ] [ИНТЕРВАЛ_СЕК] [МИН_УЧАСТНИКОВ] [--end ДД.ММ.ГГГГ ЧЧ:ММ] [НАЗВАНИЕ | НАГРАДА]</code>\n"
@@ -1810,6 +1844,7 @@ def build_router(
             "<code>/giveaway finish force</code>\n"
             "<code>/giveaway finish force confirm</code>\n"
             "<code>/giveaway announce_finish [НАЗВАНИЕ]</code>\n"
+            "<code>/giveaway report [НАЗВАНИЕ]</code>\n"
             "<code>/giveaway reroll</code>",
             parse_mode=ParseMode.HTML,
         )
@@ -1823,6 +1858,7 @@ def build_router(
             "giveaway_participants",
             "giveaway_finish",
             "giveaway_announce_finish",
+            "giveaway_report",
             "giveaway_reroll",
             "twitch_announce",
         )
@@ -1838,6 +1874,7 @@ def build_router(
             "giveaway_participants": "participants",
             "giveaway_finish": "finish",
             "giveaway_announce_finish": "announce_finish",
+            "giveaway_report": "report",
             "giveaway_reroll": "reroll",
             "twitch_announce": "twitch_announce",
         }
